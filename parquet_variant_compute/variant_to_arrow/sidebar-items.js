@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["get_type_name","make_variant_to_arrow_row_builder"],"struct":["VariantPathRowBuilder","VariantToBinaryVariantArrowRowBuilder","VariantToPrimitiveArrowRowBuilder"],"trait":["VariantToArrowRowBuilder","VariantToArrowRowBuilderWithPath"]};
