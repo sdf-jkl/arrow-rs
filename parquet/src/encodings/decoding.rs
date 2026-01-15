@@ -335,7 +335,7 @@ impl<T: DataType> Decoder<T> for PlainDecoder<T> {
 /// Dictionary decoder.
 ///
 /// The dictionary encoding builds a dictionary of values encountered in a given column.
-/// The dictionary is be stored in a dictionary page per column chunk.
+/// The dictionary is stored in a dictionary page per column chunk.
 /// See [`DictEncoder`](crate::encoding::DictEncoder) for more information.
 pub struct DictDecoder<T: DataType> {
     // The dictionary, which maps ids to the values
