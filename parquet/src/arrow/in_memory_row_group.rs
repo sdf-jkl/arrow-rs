@@ -48,6 +48,11 @@ pub(crate) struct FetchRanges {
 }
 
 impl InMemoryRowGroup<'_> {
+    /// Returns metadata for this row group.
+    pub(crate) fn row_group_metadata(&self) -> &RowGroupMetaData {
+        self.metadata.row_group(self.row_group_idx)
+    }
+
     /// Returns the byte ranges to fetch for the columns specified in
     /// `projection` and `selection`.
     ///

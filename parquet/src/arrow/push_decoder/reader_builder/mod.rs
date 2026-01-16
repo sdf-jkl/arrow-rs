@@ -437,8 +437,14 @@ impl RowGroupReaderBuilder {
                     .with_parquet_metadata(&self.metadata)
                     .build_array_reader(self.fields.as_deref(), predicate.projection())?;
 
-                plan_builder =
-                    plan_builder.with_predicate(array_reader, filter_info.current_mut())?;
+                plan_builder = if filter_info
+                    .current()
+                    .can_evaluate_encoded(self.metadata.row_group(row_group_idx))
+                {
+                    plan_builder.with_encoded_predicate(&row_group, filter_info.current_mut())?
+                } else {
+                    plan_builder.with_predicate(array_reader, filter_info.current_mut())?
+                };
 
                 let row_group_info = RowGroupInfo {
                     row_group_idx,

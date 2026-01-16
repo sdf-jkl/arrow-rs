@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arrow::ProjectionMask;
+use crate::{arrow::ProjectionMask, basic::Encoding, file::metadata::RowGroupMetaData};
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
 use std::fmt::{Debug, Formatter};
@@ -35,6 +35,37 @@ pub trait ArrowPredicate: Send + 'static {
     /// possible because any columns needed for the overall projection mask are
     /// decoded again after a predicate is applied.
     fn projection(&self) -> &ProjectionMask;
+
+    /// Returns true if all columns in [`Self::projection`] can be evaluated
+    /// using dictionary-encoded data in the provided [`RowGroupMetaData`].
+    ///
+    /// This is a conservative check that only recognizes dictionary encodings
+    /// (`RLE_DICTIONARY` or `PLAIN_DICTIONARY`) as supported for encoded
+    /// evaluation.
+    fn can_evaluate_encoded(&self, row_group: &RowGroupMetaData) -> bool {
+        let projection = self.projection();
+        let Some(non_nested) = projection.without_nested_types(row_group.schema_descr()) else {
+            return false;
+        };
+        if (0..row_group.num_columns()).any(|column_idx| {
+            projection.leaf_included(column_idx) && !non_nested.leaf_included(column_idx)
+        }) {
+            return false;
+        }
+
+        (0..row_group.num_columns()).all(|column_idx| {
+            if !non_nested.leaf_included(column_idx) {
+                return true;
+            }
+            let column = row_group.column(column_idx);
+            if column.dictionary_page_offset().is_none() {
+                return false;
+            }
+            let encodings = column.encodings_mask();
+            encodings.is_set(Encoding::RLE_DICTIONARY)
+                || encodings.is_set(Encoding::PLAIN_DICTIONARY)
+        })
+    }
 
     /// Evaluate this predicate for the given [`RecordBatch`] containing the columns
     /// identified by [`Self::projection`]
