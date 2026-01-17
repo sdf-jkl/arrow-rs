@@ -19,19 +19,21 @@
 //! from a Parquet file
 
 use crate::arrow::array_reader::ArrayReader;
-use crate::arrow::arrow_reader::RowGroups;
+use crate::arrow::array_reader::RowGroups;
+use crate::arrow::array_reader::primitive_array::coerce_array;
 use crate::arrow::arrow_reader::selection::RowSelectionPolicy;
 use crate::arrow::arrow_reader::selection::RowSelectionStrategy;
 use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
+use crate::arrow::buffer::bit_util::sign_extend_be;
+use crate::arrow::buffer::offset_buffer::OffsetBuffer;
 use crate::arrow::in_memory_row_group::InMemoryRowGroup;
+use crate::arrow::schema::{ParquetField, parquet_to_arrow_field};
 use crate::basic::Encoding;
 use crate::basic::Type;
 use crate::column::page::Page;
 use crate::data_type::BoolType;
-use crate::data_type::ByteArray;
-use crate::data_type::ByteArrayType;
 use crate::data_type::DoubleType;
 use crate::data_type::FloatType;
 use crate::data_type::Int32Type;
@@ -39,15 +41,18 @@ use crate::data_type::Int64Type;
 use crate::encodings::decoding::Decoder;
 use crate::encodings::decoding::PlainDecoder;
 use crate::errors::{ParquetError, Result};
-use arrow_array::Array;
-use arrow_array::ArrayRef;
 use arrow_array::BinaryArray;
 use arrow_array::BooleanArray;
+use arrow_array::Decimal128Array;
+use arrow_array::Decimal256Array;
 use arrow_array::Float32Array;
 use arrow_array::Float64Array;
 use arrow_array::Int32Array;
 use arrow_array::Int64Array;
 use arrow_array::RecordBatch;
+use arrow_array::{Array, ArrayRef};
+use arrow_buffer::i256;
+use arrow_schema::DataType as ArrowType;
 use arrow_schema::Field;
 use arrow_schema::Schema;
 use arrow_select::filter::prep_null_mask_filter;
@@ -219,30 +224,53 @@ impl ReadPlanBuilder {
     /// This is intended for dictionary-encoded columns where the dictionary
     /// can be decoded once, the predicate applied to dictionary values, and
     /// then used to filter the RLE dictionary indices.
+    ///
+    /// `fields` is used to resolve Arrow logical types for the projected
+    /// column so the predicate sees Arrow-typed values. If `fields` is
+    /// `None`, the Arrow type is inferred from the Parquet schema.
     pub(crate) fn with_encoded_predicate(
         self,
         row_group: &InMemoryRowGroup<'_>,
         predicate: &mut dyn ArrowPredicate,
+        fields: Option<&ParquetField>,
     ) -> Result<Self> {
-        let row_group_metadata = row_group.row_group_metadata();
-        let projection = predicate.projection();
-        let projected_columns: Vec<usize> = (0..row_group_metadata.num_columns())
-            .filter(|column_idx| projection.leaf_included(*column_idx))
-            .collect();
-
-        if projected_columns.is_empty() {
-            return Ok(self);
-        }
-
-        if projected_columns.len() > 1 {
+        let context = Self::encoded_predicate_context(row_group, predicate, fields)?;
+        let EncodedPredicateContext::Supported {
+            column_idx,
+            arrow_type,
+        } = context
+        else {
             return Err(ParquetError::General(
-                "Encoded predicate evaluation only supports a single column".to_string(),
+                "Encoded predicate evaluation is not supported for this projection".to_string(),
             ));
-        }
+        };
 
-        let column_idx = projected_columns[0];
-        let selection = Self::evaluate_dictionary_predicate(row_group, column_idx, predicate)?;
+        let existing_selection = self.selection.as_ref();
+        let selection = Self::evaluate_dictionary_predicate(
+            row_group,
+            column_idx,
+            predicate,
+            &arrow_type,
+            existing_selection,
+        )?;
         self.with_encoded_selection(selection)
+    }
+
+    /// Returns true if an encoded predicate evaluation is supported for this
+    /// row group and predicate projection.
+    ///
+    /// This checks that the predicate projects exactly one non-nested,
+    /// non-nullable column, and that the Parquet physical type can be mapped
+    /// to the resolved Arrow logical type.
+    pub(crate) fn encoded_predicate_supported(
+        row_group: &InMemoryRowGroup<'_>,
+        predicate: &dyn ArrowPredicate,
+        fields: Option<&ParquetField>,
+    ) -> bool {
+        matches!(
+            Self::encoded_predicate_context(row_group, predicate, fields),
+            Ok(EncodedPredicateContext::Supported { .. })
+        )
     }
 
     /// Create a final `ReadPlan` the read plan for the scan
@@ -286,6 +314,8 @@ impl ReadPlanBuilder {
         row_group: &InMemoryRowGroup<'_>,
         column_idx: usize,
         predicate: &mut dyn ArrowPredicate,
+        arrow_type: &ArrowType,
+        existing_selection: Option<&RowSelection>,
     ) -> Result<RowSelection> {
         let row_group_metadata = row_group.row_group_metadata();
         let column = row_group_metadata.column(column_idx);
@@ -330,7 +360,8 @@ impl ReadPlanBuilder {
             )));
         }
 
-        let dict_array = Self::decode_dictionary_page(column_descr, dict_buf, dict_values)?;
+        let dict_array =
+            Self::decode_dictionary_page(column_descr, arrow_type, dict_buf, dict_values)?;
         let dict_schema = Schema::new(vec![Field::new(
             column_descr.name(),
             dict_array.data_type().clone(),
@@ -427,21 +458,29 @@ impl ReadPlanBuilder {
                 ));
             }
 
-            let values: Vec<bool> = indices
-                .iter()
-                .map(|index| {
-                    let index = *index as usize;
-                    dict_allowed.get(index).copied().unwrap_or(false)
-                })
-                .collect();
+            let mut values = Vec::with_capacity(indices.len());
+            for index in indices {
+                let index = index as usize;
+                let allowed = dict_allowed.get(index).copied().ok_or_else(|| {
+                    ParquetError::General(format!(
+                        "Dictionary index {index} out of bounds for dictionary with {} values",
+                        dict_allowed.len()
+                    ))
+                })?;
+                values.push(allowed);
+            }
             filters.push(BooleanArray::from(values));
         }
 
-        Ok(RowSelection::from_filters(&filters))
+        match existing_selection {
+            None => Ok(RowSelection::from_filters(&filters)),
+            Some(selection) => Self::apply_selection_to_filters(&filters, selection),
+        }
     }
 
     fn decode_dictionary_page(
         column_descr: &crate::schema::types::ColumnDescriptor,
+        arrow_type: &ArrowType,
         buf: Bytes,
         num_values: u32,
     ) -> Result<ArrayRef> {
@@ -450,29 +489,37 @@ impl ReadPlanBuilder {
             Type::BOOLEAN => {
                 Self::decode_plain::<BoolType>(buf, num_values, column_descr.type_length())
                     .map(|values| std::sync::Arc::new(BooleanArray::from(values)) as ArrayRef)
+                    .and_then(|array| coerce_array(array, arrow_type))
             }
             Type::INT32 => {
                 Self::decode_plain::<Int32Type>(buf, num_values, column_descr.type_length())
                     .map(|values| std::sync::Arc::new(Int32Array::from(values)) as ArrayRef)
+                    .and_then(|array| coerce_array(array, arrow_type))
             }
             Type::INT64 => {
                 Self::decode_plain::<Int64Type>(buf, num_values, column_descr.type_length())
                     .map(|values| std::sync::Arc::new(Int64Array::from(values)) as ArrayRef)
+                    .and_then(|array| coerce_array(array, arrow_type))
             }
             Type::FLOAT => {
                 Self::decode_plain::<FloatType>(buf, num_values, column_descr.type_length())
                     .map(|values| std::sync::Arc::new(Float32Array::from(values)) as ArrayRef)
+                    .and_then(|array| coerce_array(array, arrow_type))
             }
             Type::DOUBLE => {
                 Self::decode_plain::<DoubleType>(buf, num_values, column_descr.type_length())
                     .map(|values| std::sync::Arc::new(Float64Array::from(values)) as ArrayRef)
+                    .and_then(|array| coerce_array(array, arrow_type))
             }
+            // Type::INT96 => {
+            //     let values =
+            //         Self::decode_plain::<Int96Type>(buf, num_values, column_descr.type_length())?;
+            //     let buffer = values.into_buffer(arrow_type);
+            //     let array = Int64Array::new(ScalarBuffer::new(buffer, 0, num_values), None);
+            //     coerce_array(std::sync::Arc::new(array) as ArrayRef, arrow_type)
+            // }
             Type::BYTE_ARRAY => {
-                Self::decode_plain::<ByteArrayType>(buf, num_values, column_descr.type_length())
-                    .map(|values| {
-                        let bytes = values.iter().map(ByteArray::data);
-                        std::sync::Arc::new(BinaryArray::from_iter_values(bytes)) as ArrayRef
-                    })
+                Self::decode_byte_array_dictionary(arrow_type, buf, num_values as u32)
             }
             other => Err(ParquetError::General(format!(
                 "Encoded predicate evaluation does not support physical type {other:?}"
@@ -495,6 +542,255 @@ impl ReadPlanBuilder {
             ));
         }
         Ok(values)
+    }
+
+    fn decode_byte_array_dictionary(
+        arrow_type: &ArrowType,
+        buf: Bytes,
+        num_values: u32,
+    ) -> Result<ArrayRef> {
+        if matches!(arrow_type, ArrowType::Dictionary(_, _)) {
+            return Err(ParquetError::General(
+                "Encoded predicate evaluation does not support dictionary Arrow types".to_string(),
+            ));
+        }
+
+        let validate_utf8 = matches!(arrow_type, ArrowType::Utf8 | ArrowType::LargeUtf8);
+        let len = num_values as usize;
+
+        match arrow_type {
+            ArrowType::LargeUtf8 | ArrowType::LargeBinary => {
+                Self::decode_byte_array_dictionary_impl::<i64>(arrow_type, buf, len, validate_utf8)
+            }
+            ArrowType::Utf8
+            | ArrowType::Binary
+            | ArrowType::Decimal128(_, _)
+            | ArrowType::Decimal256(_, _) => {
+                Self::decode_byte_array_dictionary_impl::<i32>(arrow_type, buf, len, validate_utf8)
+            }
+            _ => Err(ParquetError::General(format!(
+                "Encoded predicate evaluation does not support Arrow type {arrow_type:?}"
+            ))),
+        }
+    }
+
+    fn decode_byte_array_dictionary_impl<I: arrow_array::OffsetSizeTrait>(
+        arrow_type: &ArrowType,
+        buf: Bytes,
+        len: usize,
+        validate_utf8: bool,
+    ) -> Result<ArrayRef> {
+        let mut buffer = OffsetBuffer::<I>::default();
+        let mut decoder = crate::arrow::array_reader::byte_array::ByteArrayDecoderPlain::new(
+            buf,
+            len,
+            Some(len),
+            validate_utf8,
+        );
+        decoder.read(&mut buffer, usize::MAX)?;
+
+        match arrow_type {
+            ArrowType::Decimal128(p, s) => {
+                let array = buffer.into_array(None, ArrowType::Binary);
+                let binary = array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| {
+                        ParquetError::General(
+                            "Failed to build binary array from dictionary values".to_string(),
+                        )
+                    })?;
+                let decimal = Decimal128Array::from_unary(binary, |x| match x.len() {
+                    0 => i128::default(),
+                    _ => i128::from_be_bytes(sign_extend_be(x)),
+                })
+                .with_precision_and_scale(*p, *s)?;
+                Ok(std::sync::Arc::new(decimal))
+            }
+            ArrowType::Decimal256(p, s) => {
+                let array = buffer.into_array(None, ArrowType::Binary);
+                let binary = array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| {
+                        ParquetError::General(
+                            "Failed to build binary array from dictionary values".to_string(),
+                        )
+                    })?;
+                let decimal = Decimal256Array::from_unary(binary, |x| match x.len() {
+                    0 => i256::default(),
+                    _ => i256::from_be_bytes(sign_extend_be(x)),
+                })
+                .with_precision_and_scale(*p, *s)?;
+                Ok(std::sync::Arc::new(decimal))
+            }
+            _ => Ok(buffer.into_array(None, arrow_type.clone())),
+        }
+    }
+
+    /// Applies an existing selection to a list of page-aligned boolean filters,
+    /// reducing them to only the rows already selected.
+    ///
+    /// This is required when evaluating a predicate on encoded data after
+    /// a prior selection has already been applied.
+    fn apply_selection_to_filters(
+        filters: &[BooleanArray],
+        selection: &RowSelection,
+    ) -> Result<RowSelection> {
+        let total_rows = selection.row_count() + selection.skipped_row_count();
+        let filter_rows: usize = filters.iter().map(|filter| filter.len()).sum();
+        if total_rows != filter_rows {
+            return Err(ParquetError::General(format!(
+                "Encoded predicate evaluation produced {filter_rows} rows, expected {total_rows}"
+            )));
+        }
+
+        let mut values = Vec::with_capacity(filter_rows);
+        for filter in filters {
+            for idx in 0..filter.len() {
+                values.push(filter.value(idx));
+            }
+        }
+
+        let mut reduced = Vec::with_capacity(selection.row_count());
+        let mut pos = 0usize;
+        for selector in selection.iter() {
+            if selector.skip {
+                pos = pos.saturating_add(selector.row_count);
+                continue;
+            }
+
+            for _ in 0..selector.row_count {
+                reduced.push(values[pos]);
+                pos += 1;
+            }
+        }
+
+        if pos != values.len() {
+            return Err(ParquetError::General(
+                "Encoded predicate selection did not consume all rows".to_string(),
+            ));
+        }
+
+        Ok(RowSelection::from_filters(&[BooleanArray::from(reduced)]))
+    }
+}
+
+enum EncodedPredicateContext {
+    Supported {
+        column_idx: usize,
+        arrow_type: ArrowType,
+    },
+    Unsupported,
+}
+
+impl ReadPlanBuilder {
+    fn encoded_predicate_context(
+        row_group: &InMemoryRowGroup<'_>,
+        predicate: &dyn ArrowPredicate,
+        fields: Option<&ParquetField>,
+    ) -> Result<EncodedPredicateContext> {
+        let row_group_metadata = row_group.row_group_metadata();
+        let projection = predicate.projection();
+        let projected_columns: Vec<usize> = (0..row_group_metadata.num_columns())
+            .filter(|column_idx| projection.leaf_included(*column_idx))
+            .collect();
+
+        if projected_columns.len() != 1 {
+            return Ok(EncodedPredicateContext::Unsupported);
+        }
+
+        let column_idx = projected_columns[0];
+        let column = row_group_metadata.column(column_idx);
+        let column_descr = column.column_descr();
+
+        if column_descr.max_def_level() > 0 || column_descr.max_rep_level() > 0 {
+            return Ok(EncodedPredicateContext::Unsupported);
+        }
+
+        let arrow_type = match Self::arrow_type_for_column(fields, column_idx) {
+            Some(arrow_type) => arrow_type.clone(),
+            None => parquet_to_arrow_field(column_descr)
+                .map(|f| f.data_type().clone())
+                .map_err(|err| ParquetError::General(err.to_string()))?,
+        };
+
+        if !Self::supports_encoded_dictionary_type(column_descr.physical_type(), &arrow_type) {
+            return Ok(EncodedPredicateContext::Unsupported);
+        }
+
+        Ok(EncodedPredicateContext::Supported {
+            column_idx,
+            arrow_type,
+        })
+    }
+
+    fn arrow_type_for_column<'a>(
+        field: Option<&'a ParquetField>,
+        column_idx: usize,
+    ) -> Option<&'a ArrowType> {
+        let field = field?;
+        match &field.field_type {
+            crate::arrow::schema::ParquetFieldType::Primitive { col_idx, .. } => {
+                (*col_idx == column_idx).then_some(&field.arrow_type)
+            }
+            crate::arrow::schema::ParquetFieldType::Group { children } => children
+                .iter()
+                .find_map(|child| Self::arrow_type_for_column(Some(child), column_idx)),
+            crate::arrow::schema::ParquetFieldType::Virtual(_) => None,
+        }
+    }
+
+    fn supports_encoded_dictionary_type(physical: Type, arrow_type: &ArrowType) -> bool {
+        if matches!(arrow_type, ArrowType::Dictionary(_, _)) {
+            return false;
+        }
+
+        match physical {
+            Type::BOOLEAN => matches!(arrow_type, ArrowType::Boolean),
+            Type::INT32 => matches!(
+                arrow_type,
+                ArrowType::UInt8
+                    | ArrowType::Int8
+                    | ArrowType::UInt16
+                    | ArrowType::Int16
+                    | ArrowType::Int32
+                    | ArrowType::UInt32
+                    | ArrowType::Date32
+                    | ArrowType::Date64
+                    | ArrowType::Time32(_)
+                    | ArrowType::Timestamp(_, _)
+                    | ArrowType::Decimal32(_, _)
+                    | ArrowType::Decimal64(_, _)
+                    | ArrowType::Decimal128(_, _)
+                    | ArrowType::Decimal256(_, _)
+            ),
+            Type::INT64 => matches!(
+                arrow_type,
+                ArrowType::Int64
+                    | ArrowType::UInt64
+                    | ArrowType::Date64
+                    | ArrowType::Time64(_)
+                    | ArrowType::Duration(_)
+                    | ArrowType::Timestamp(_, _)
+                    | ArrowType::Decimal64(_, _)
+                    | ArrowType::Decimal128(_, _)
+                    | ArrowType::Decimal256(_, _)
+            ),
+            Type::FLOAT => matches!(arrow_type, ArrowType::Float32),
+            Type::DOUBLE => matches!(arrow_type, ArrowType::Float64),
+            Type::INT96 => matches!(arrow_type, ArrowType::Timestamp(_, _)),
+            Type::BYTE_ARRAY => matches!(
+                arrow_type,
+                ArrowType::Binary
+                    | ArrowType::LargeBinary
+                    | ArrowType::Utf8
+                    | ArrowType::LargeUtf8
+                    | ArrowType::Decimal128(_, _)
+                    | ArrowType::Decimal256(_, _)
+            ),
+            _ => false,
+        }
     }
 }
 

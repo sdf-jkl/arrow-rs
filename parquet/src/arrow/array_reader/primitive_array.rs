@@ -39,7 +39,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 /// Provides conversion from `Vec<T>` to `Buffer`
-pub trait IntoBuffer {
+pub(crate) trait IntoBuffer {
     fn into_buffer(self, target_type: &ArrowType) -> Buffer;
 }
 
@@ -221,7 +221,7 @@ where
 /// Coerce the parquet physical type array to the target type
 ///
 /// This should match the logic in schema::primitive::apply_hint
-fn coerce_array(array: ArrayRef, target_type: &ArrowType) -> Result<ArrayRef> {
+pub(crate) fn coerce_array(array: ArrayRef, target_type: &ArrowType) -> Result<ArrayRef> {
     if let ArrowType::Dictionary(key_type, value_type) = target_type {
         let dictionary = pack_dictionary(key_type, array.as_ref())?;
         let any_dictionary = dictionary.as_any_dictionary();

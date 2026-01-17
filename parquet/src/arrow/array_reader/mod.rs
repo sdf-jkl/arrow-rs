@@ -31,7 +31,7 @@ use crate::file::metadata::ParquetMetaData;
 use crate::file::reader::{FilePageIterator, FileReader};
 
 mod builder;
-mod byte_array;
+pub mod byte_array;
 mod byte_array_dictionary;
 mod byte_view_array;
 mod cached_array_reader;
@@ -41,7 +41,7 @@ mod fixed_size_list_array;
 mod list_array;
 mod map_array;
 mod null_array;
-mod primitive_array;
+pub mod primitive_array;
 mod row_group_cache;
 mod row_group_index;
 mod row_number;

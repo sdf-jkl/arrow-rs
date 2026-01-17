@@ -53,18 +53,26 @@ pub trait ArrowPredicate: Send + 'static {
             return false;
         }
 
-        (0..row_group.num_columns()).all(|column_idx| {
-            if !non_nested.leaf_included(column_idx) {
-                return true;
-            }
-            let column = row_group.column(column_idx);
-            if column.dictionary_page_offset().is_none() {
-                return false;
-            }
-            let encodings = column.encodings_mask();
-            encodings.is_set(Encoding::RLE_DICTIONARY)
-                || encodings.is_set(Encoding::PLAIN_DICTIONARY)
-        })
+        let projected_columns: Vec<usize> = (0..row_group.num_columns())
+            .filter(|column_idx| non_nested.leaf_included(*column_idx))
+            .collect();
+
+        if projected_columns.len() != 1 {
+            return false;
+        }
+
+        let column = row_group.column(projected_columns[0]);
+        let column_descr = column.column_descr();
+        if column_descr.max_def_level() > 0 || column_descr.max_rep_level() > 0 {
+            return false;
+        }
+
+        if column.dictionary_page_offset().is_none() {
+            return false;
+        }
+
+        let encodings = column.encodings_mask();
+        encodings.is_set(Encoding::RLE_DICTIONARY) || encodings.is_set(Encoding::PLAIN_DICTIONARY)
     }
 
     /// Evaluate this predicate for the given [`RecordBatch`] containing the columns
