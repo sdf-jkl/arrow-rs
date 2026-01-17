@@ -708,6 +708,24 @@ impl ReadPlanBuilder {
             return Ok(EncodedPredicateContext::Unsupported);
         }
 
+        let Some(page_encoding_stats_mask) = column.page_encoding_stats_mask() else {
+            return Ok(EncodedPredicateContext::Unsupported);
+        };
+
+        let mut saw_dictionary = false;
+        for encoding in page_encoding_stats_mask.encodings() {
+            match encoding {
+                Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                    saw_dictionary = true;
+                }
+                _ => return Ok(EncodedPredicateContext::Unsupported),
+            }
+        }
+
+        if !saw_dictionary {
+            return Ok(EncodedPredicateContext::Unsupported);
+        }
+
         let arrow_type = match Self::arrow_type_for_column(fields, column_idx) {
             Some(arrow_type) => arrow_type.clone(),
             None => parquet_to_arrow_field(column_descr)
@@ -916,9 +934,141 @@ impl ReadPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::ProjectionMask;
+    use crate::basic::{Encoding, EncodingMask, Repetition, Type as PhysicalType};
+    use crate::file::metadata::{ColumnChunkMetaData, FileMetaData, ParquetMetaData, RowGroupMetaData};
+    use crate::schema::types::{SchemaDescriptor, Type as SchemaType};
+    use arrow_array::{BooleanArray, RecordBatch};
+    use arrow_schema::ArrowError;
+    use std::sync::Arc;
 
     fn builder_with_selection(selection: RowSelection) -> ReadPlanBuilder {
         ReadPlanBuilder::new(1024).with_selection(Some(selection))
+    }
+
+    struct TestPredicate {
+        projection: ProjectionMask,
+    }
+
+    impl TestPredicate {
+        fn new(projection: ProjectionMask) -> Self {
+            Self { projection }
+        }
+    }
+
+    impl ArrowPredicate for TestPredicate {
+        fn projection(&self) -> &ProjectionMask {
+            &self.projection
+        }
+
+        fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+            Ok(BooleanArray::from(vec![true; batch.num_rows()]))
+        }
+    }
+
+    fn build_metadata(
+        page_encoding_stats_mask: Option<EncodingMask>,
+    ) -> (ParquetMetaData, Arc<SchemaDescriptor>) {
+        let schema = SchemaType::group_type_builder("schema")
+            .with_fields(vec![Arc::new(
+                SchemaType::primitive_type_builder("a", PhysicalType::INT32)
+                    .with_repetition(Repetition::REQUIRED)
+                    .build()
+                    .unwrap(),
+            )])
+            .build()
+            .unwrap();
+
+        let schema_descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+        let column_descr = schema_descr.column(0);
+
+        let mut column_builder = ColumnChunkMetaData::builder(column_descr)
+            .set_num_values(10)
+            .set_data_page_offset(0)
+            .set_dictionary_page_offset(Some(4))
+            .set_encodings_mask(EncodingMask::new_from_encodings(
+                [Encoding::PLAIN_DICTIONARY].iter(),
+            ));
+
+        if let Some(mask) = page_encoding_stats_mask {
+            column_builder = column_builder.set_page_encoding_stats_mask(mask);
+        }
+
+        let column_meta = column_builder.build().unwrap();
+        let row_group = RowGroupMetaData::builder(schema_descr.clone())
+            .set_num_rows(10)
+            .add_column_metadata(column_meta)
+            .build()
+            .unwrap();
+
+        let file_metadata = FileMetaData::new(1, 10, None, None, schema_descr.clone(), None);
+        let parquet_metadata = ParquetMetaData::new(file_metadata, vec![row_group]);
+
+        (parquet_metadata, schema_descr)
+    }
+
+    #[test]
+    fn encoded_predicate_requires_page_encoding_stats_mask() {
+        let (metadata, schema_descr) = build_metadata(None);
+        let projection = ProjectionMask::leaves(&schema_descr, [0]);
+        let predicate = TestPredicate::new(projection);
+        let row_group = InMemoryRowGroup {
+            offset_index: None,
+            column_chunks: vec![None; schema_descr.num_columns()],
+            row_count: 10,
+            row_group_idx: 0,
+            metadata: &metadata,
+        };
+
+        assert!(!ReadPlanBuilder::encoded_predicate_supported(
+            &row_group,
+            &predicate,
+            None
+        ));
+    }
+
+    #[test]
+    fn encoded_predicate_rejects_non_dictionary_page_encodings() {
+        let mask = EncodingMask::new_from_encodings(
+            [Encoding::PLAIN_DICTIONARY, Encoding::PLAIN].iter(),
+        );
+        let (metadata, schema_descr) = build_metadata(Some(mask));
+        let projection = ProjectionMask::leaves(&schema_descr, [0]);
+        let predicate = TestPredicate::new(projection);
+        let row_group = InMemoryRowGroup {
+            offset_index: None,
+            column_chunks: vec![None; schema_descr.num_columns()],
+            row_count: 10,
+            row_group_idx: 0,
+            metadata: &metadata,
+        };
+
+        assert!(!ReadPlanBuilder::encoded_predicate_supported(
+            &row_group,
+            &predicate,
+            None
+        ));
+    }
+
+    #[test]
+    fn encoded_predicate_accepts_dictionary_only_page_encodings() {
+        let mask = EncodingMask::new_from_encodings([Encoding::RLE_DICTIONARY].iter());
+        let (metadata, schema_descr) = build_metadata(Some(mask));
+        let projection = ProjectionMask::leaves(&schema_descr, [0]);
+        let predicate = TestPredicate::new(projection);
+        let row_group = InMemoryRowGroup {
+            offset_index: None,
+            column_chunks: vec![None; schema_descr.num_columns()],
+            row_count: 10,
+            row_group_idx: 0,
+            metadata: &metadata,
+        };
+
+        assert!(ReadPlanBuilder::encoded_predicate_supported(
+            &row_group,
+            &predicate,
+            None
+        ));
     }
 
     #[test]
