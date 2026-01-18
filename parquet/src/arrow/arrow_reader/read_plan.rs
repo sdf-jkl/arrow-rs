@@ -472,9 +472,36 @@ impl ReadPlanBuilder {
             filters.push(BooleanArray::from(values));
         }
 
+        let raw = RowSelection::from_filters(&filters);
         match existing_selection {
-            None => Ok(RowSelection::from_filters(&filters)),
-            Some(selection) => Self::apply_selection_to_filters(&filters, selection),
+            None => Ok(raw),
+            Some(selection) => {
+                let filter_rows: usize = filters.iter().map(|filter| filter.len()).sum();
+                if filter_rows == selection.row_count() {
+                    Ok(raw)
+                } else {
+                    let mut selection_for_filters = selection.clone();
+                    let total_rows =
+                        selection_for_filters.row_count() + selection_for_filters.skipped_row_count();
+                    if filter_rows > total_rows {
+                        let mut selectors: Vec<RowSelector> =
+                            selection_for_filters.iter().cloned().collect();
+                        selectors.push(RowSelector::skip(filter_rows - total_rows));
+                        selection_for_filters = RowSelection::from(selectors);
+                    }
+
+                    let total_rows =
+                        selection_for_filters.row_count() + selection_for_filters.skipped_row_count();
+                    if filter_rows == total_rows {
+                        Self::apply_selection_to_filters(&filters, &selection_for_filters)
+                    } else {
+                        Err(ParquetError::General(format!(
+                            "Encoded predicate evaluation produced {filter_rows} rows, expected {total_rows} or {}",
+                            selection.row_count()
+                        )))
+                    }
+                }
+            }
         }
     }
 
@@ -632,7 +659,8 @@ impl ReadPlanBuilder {
     /// reducing them to only the rows already selected.
     ///
     /// This is required when evaluating a predicate on encoded data after
-    /// a prior selection has already been applied.
+    /// a prior selection has already been applied, but the encoded evaluation
+    /// was performed on full row group pages.
     fn apply_selection_to_filters(
         filters: &[BooleanArray],
         selection: &RowSelection,

@@ -437,9 +437,30 @@ impl RowGroupReaderBuilder {
                     .with_parquet_metadata(&self.metadata)
                     .build_array_reader(self.fields.as_deref(), predicate.projection())?;
 
-                let can_encode = filter_info
-                    .current()
-                    .can_evaluate_encoded(self.metadata.row_group(row_group_idx))
+                let predicate_column_idx = predicate
+                    .projection()
+                    .without_nested_types(row_group.row_group_metadata().schema_descr())
+                    .and_then(|non_nested| {
+                        let projected_columns: Vec<usize> = (0
+                            ..row_group.row_group_metadata().num_columns())
+                            .filter(|column_idx| non_nested.leaf_included(*column_idx))
+                            .collect();
+                        (projected_columns.len() == 1).then_some(projected_columns[0])
+                    });
+
+                let predicate_column_sparse = predicate_column_idx
+                    .and_then(|column_idx| row_group.column_chunks.get(column_idx))
+                    .and_then(|chunk| chunk.as_ref())
+                    .is_some_and(|chunk| matches!(chunk.as_ref(), ColumnChunkData::Sparse { .. }));
+
+                let predicate_column_cached = predicate_column_idx
+                    .is_some_and(|column_idx| filter_info.cache_projection().leaf_included(column_idx));
+
+                let can_encode = !predicate_column_sparse
+                    && !predicate_column_cached
+                    && filter_info
+                        .current()
+                        .can_evaluate_encoded(self.metadata.row_group(row_group_idx))
                     && ReadPlanBuilder::encoded_predicate_supported(
                         &row_group,
                         filter_info.current(),

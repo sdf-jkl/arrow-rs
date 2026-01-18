@@ -39,7 +39,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 /// Provides conversion from `Vec<T>` to `Buffer`
-pub(crate) trait IntoBuffer {
+pub trait IntoBuffer {
     fn into_buffer(self, target_type: &ArrowType) -> Buffer;
 }
 
