@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::arrow::ProjectionMask;
+use crate::arrow::in_memory_row_group::FetchRanges;
 use crate::errors::ParquetError;
 use crate::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation};
 use arrow_array::{Array, BooleanArray};
@@ -269,18 +270,6 @@ impl RowSelection {
             let ranges = self.scan_ranges(locations);
             !ranges.is_empty() && ranges.len() < locations.len()
         })
-    }
-
-    /// Returns true if bitmasks should be page aware
-    pub(crate) fn requires_page_aware_mask(
-        &self,
-        projection: &ProjectionMask,
-        offset_index: Option<&[OffsetIndexMetaData]>,
-    ) -> bool {
-        match offset_index {
-            Some(columns) => self.selection_skips_any_page(projection, columns),
-            None => false,
-        }
     }
 
     /// Splits off the first `row_count` from this [`RowSelection`]
@@ -768,6 +757,8 @@ fn union_row_selections(left: &[RowSelector], right: &[RowSelector]) -> RowSelec
 #[derive(Debug)]
 pub struct MaskCursor {
     mask: BooleanBuffer,
+    /// Optional page start offsets for each requested column.
+    page_start_offsets: Option<Vec<Vec<u64>>>,
     /// Current absolute offset into the selection
     position: usize,
 }
@@ -780,11 +771,7 @@ impl MaskCursor {
 
     /// Advance through the mask representation, producing the next chunk summary.
     /// Optionally clips chunk boundaries to the next page boundary.
-    pub fn next_mask_chunk(
-        &mut self,
-        batch_size: usize,
-        page_boundaries: Option<&[usize]>,
-    ) -> Option<MaskChunk> {
+    pub fn next_mask_chunk(&mut self, batch_size: usize) -> Option<MaskChunk> {
         let (initial_skip, chunk_rows, selected_rows, mask_start, end_position) = {
             let mask = &self.mask;
 
@@ -917,9 +904,16 @@ pub enum RowSelectionCursor {
 
 impl RowSelectionCursor {
     /// Create a [`MaskCursor`] cursor backed by a bitmask, from an existing set of selectors
-    pub(crate) fn new_mask_from_selectors(selectors: Vec<RowSelector>) -> Self {
+    /// Optional page start offsets for each requested column.
+    ///
+    /// See [`FetchRanges::page_start_offsets`] for more details
+    pub(crate) fn new_mask_from_selectors(
+        selectors: Vec<RowSelector>,
+        page_start_offsets: Option<Vec<Vec<u64>>>,
+    ) -> Self {
         Self::Mask(MaskCursor {
             mask: boolean_mask_from_selectors(&selectors),
+            page_start_offsets,
             position: 0,
         })
     }

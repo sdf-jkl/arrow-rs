@@ -74,6 +74,11 @@ impl DataRequest {
             .collect()
     }
 
+    /// Take the page_start_offsets, if any, and returns them
+    pub fn take_page_start_offsets(&mut self) -> Option<Vec<Vec<u64>>> {
+        self.page_start_offsets.take()
+    }
+
     /// Create a new InMemoryRowGroup, and fill it with provided data
     ///
     /// Assumes that all needed data is present in the buffers
