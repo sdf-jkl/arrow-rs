@@ -40,6 +40,8 @@ pub(super) struct DataRequest {
     ranges: Vec<Range<u64>>,
     /// Optional page start offsets for each requested range. This is used
     /// to create the relevant InMemoryRowGroup
+    ///
+    /// See [`FetchRanges::page_start_offsets`] for more details
     page_start_offsets: Option<Vec<Vec<u64>>>,
 }
 
