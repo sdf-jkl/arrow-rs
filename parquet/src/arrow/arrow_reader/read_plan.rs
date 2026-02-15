@@ -26,11 +26,9 @@ use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
 use crate::errors::{ParquetError, Result};
-use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use arrow_array::Array;
 use arrow_select::filter::prep_null_mask_filter;
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 /// A builder for [`ReadPlan`]
 #[derive(Clone, Debug)]
@@ -40,8 +38,10 @@ pub struct ReadPlanBuilder {
     selection: Option<RowSelection>,
     /// Policy to use when materializing the row selection
     row_selection_policy: RowSelectionPolicy,
-    /// Precomputed page boundary row indices for mask chunking
-    page_boundaries: Option<Arc<[usize]>>,
+    /// Optional page start offsets for each requested column.
+    ///
+    /// See [`FetchRanges::page_start_offsets`] for more details
+    page_start_offsets: Option<Vec<Vec<u64>>>,
 }
 
 impl ReadPlanBuilder {
@@ -51,7 +51,7 @@ impl ReadPlanBuilder {
             batch_size,
             selection: None,
             row_selection_policy: RowSelectionPolicy::default(),
-            page_boundaries: None,
+            page_start_offsets: None,
         }
     }
 
@@ -184,27 +184,8 @@ impl ReadPlanBuilder {
     /// Add offset index metadata for each column in a row group to this `ReadPlanBuilder`
     ///
     /// The computed page boundaries only include columns in the provided `projection`.
-    pub fn with_offset_index_metadata(
-        mut self,
-        metadata: Option<Arc<[OffsetIndexMetaData]>>,
-        projection: &ProjectionMask,
-    ) -> Self {
-        self.page_boundaries = metadata.as_ref().map(|columns| {
-            let mut boundaries: Vec<usize> = columns
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| projection.leaf_included(*idx))
-                .flat_map(|(_, column)| {
-                    column
-                        .page_locations()
-                        .iter()
-                        .map(|loc| loc.first_row_index as usize)
-                })
-                .collect();
-            boundaries.sort_unstable();
-            boundaries.dedup();
-            boundaries.into()
-        });
+    pub fn with_page_start_offsets(mut self, page_start_offsets: Option<Vec<Vec<u64>>>) -> Self {
+        self.page_start_offsets = page_start_offsets;
         self
     }
 
@@ -222,7 +203,7 @@ impl ReadPlanBuilder {
             batch_size,
             selection,
             row_selection_policy: _,
-            page_boundaries: _,
+            page_start_offsets,
         } = self;
 
         let selection = selection.map(|s| s.trim());
@@ -233,7 +214,7 @@ impl ReadPlanBuilder {
                 let selectors: Vec<RowSelector> = trimmed.into();
                 match selection_strategy {
                     RowSelectionStrategy::Mask => {
-                        RowSelectionCursor::new_mask_from_selectors(selectors)
+                        RowSelectionCursor::new_mask_from_selectors(selectors, page_start_offsets)
                     }
                     RowSelectionStrategy::Selectors => RowSelectionCursor::new_selectors(selectors),
                 }
@@ -243,7 +224,6 @@ impl ReadPlanBuilder {
         ReadPlan {
             batch_size,
             row_selection_cursor,
-            page_boundaries: self.page_boundaries,
         }
     }
 }
@@ -342,8 +322,6 @@ pub struct ReadPlan {
     batch_size: usize,
     /// Row ranges to be selected from the data source
     row_selection_cursor: RowSelectionCursor,
-    /// Precomputed page boundary row indices for mask chunking
-    page_boundaries: Option<Arc<[usize]>>,
 }
 
 impl ReadPlan {
@@ -366,11 +344,6 @@ impl ReadPlan {
     #[inline(always)]
     pub fn batch_size(&self) -> usize {
         self.batch_size
-    }
-
-    /// Return the page boundary row indices used for mask chunking
-    pub fn page_boundaries(&self) -> Option<Arc<[usize]>> {
-        self.page_boundaries.clone()
     }
 }
 

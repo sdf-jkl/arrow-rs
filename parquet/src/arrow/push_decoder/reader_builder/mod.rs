@@ -240,13 +240,9 @@ impl RowGroupReaderBuilder {
                 "Internal Error: next_row_group called while still reading a row group. Expected Finished state, got {state:?}"
             )));
         }
-        let offset_index_metadata = self
-            .row_group_offset_index(row_group_idx)
-            .map(|columns| columns.to_vec().into());
         let plan_builder = ReadPlanBuilder::new(self.batch_size)
             .with_selection(selection)
-            .with_row_selection_policy(self.row_selection_policy)
-            .with_offset_index_metadata(offset_index_metadata, &self.projection);
+            .with_row_selection_policy(self.row_selection_policy);
 
         let row_group_info = RowGroupInfo {
             row_group_idx,
@@ -400,7 +396,7 @@ impl RowGroupReaderBuilder {
             }
             RowGroupDecoderState::WaitingOnFilterData {
                 row_group_info,
-                data_request,
+                mut data_request,
                 mut filter_info,
             } => {
                 // figure out what ranges we still need
@@ -426,7 +422,8 @@ impl RowGroupReaderBuilder {
 
                 let predicate = filter_info.current();
 
-                let row_group = data_request.try_into_in_memory_row_group(
+                let page_start_offsets = data_request.take_page_start_offsets();
+                let in_memory_row_group = data_request.try_into_in_memory_row_group(
                     row_group_idx,
                     row_count,
                     &self.metadata,
@@ -436,18 +433,14 @@ impl RowGroupReaderBuilder {
 
                 let cache_options = filter_info.cache_builder().producer();
 
-                let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
+                let array_reader = ArrayReaderBuilder::new(&in_memory_row_group, &self.metrics)
                     .with_cache_options(Some(&cache_options))
                     .with_parquet_metadata(&self.metadata)
                     .build_array_reader(self.fields.as_deref(), predicate.projection())?;
 
-                let offset_index_metadata = self
-                    .row_group_offset_index(row_group_idx)
-                    .map(|columns| columns.to_vec().into());
                 plan_builder = plan_builder
-                    .with_offset_index_metadata(offset_index_metadata, predicate.projection());
-                plan_builder =
-                    plan_builder.with_predicate(array_reader, filter_info.current_mut())?;
+                    .with_page_start_offsets(page_start_offsets)
+                    .with_predicate(array_reader, filter_info.current_mut())?;
 
                 let row_group_info = RowGroupInfo {
                     row_group_idx,
@@ -456,7 +449,7 @@ impl RowGroupReaderBuilder {
                 };
 
                 // Take back the column chunks that were read
-                let column_chunks = Some(row_group.column_chunks);
+                let column_chunks = Some(in_memory_row_group.column_chunks);
 
                 // advance to the next predicate, if any
                 match filter_info.advance() {
@@ -560,7 +553,7 @@ impl RowGroupReaderBuilder {
             // Waiting on data to proceed with reading the output
             RowGroupDecoderState::WaitingOnData {
                 row_group_info,
-                data_request,
+                mut data_request,
                 cache_info,
             } => {
                 let needed_ranges = data_request.needed_ranges(&self.buffers);
@@ -575,6 +568,8 @@ impl RowGroupReaderBuilder {
                         DecodeResult::NeedsData(needed_ranges),
                     ));
                 }
+
+                let page_start_offsets = data_request.take_page_start_offsets();
 
                 // otherwise we have all the data we need to proceed
                 let RowGroupInfo {
@@ -591,25 +586,9 @@ impl RowGroupReaderBuilder {
                     &mut self.buffers,
                 )?;
 
-                // For mask-based selection, attach offset index metadata for page-aware chunking.
-                let offset_index_metadata = if plan_builder.resolve_selection_strategy()
-                    == RowSelectionStrategy::Mask
-                    && plan_builder.selection().is_some_and(|selection| {
-                        selection.requires_page_aware_mask(
-                            &self.projection,
-                            self.row_group_offset_index(row_group_idx),
-                        )
-                    }) {
-                    self.row_group_offset_index(row_group_idx)
-                        .map(|columns| columns.to_vec().into())
-                } else {
-                    None
-                };
-
-                let plan_builder = plan_builder
-                    .with_offset_index_metadata(offset_index_metadata, &self.projection);
-
-                let plan = plan_builder.build();
+                let plan = plan_builder
+                    .with_page_start_offsets(page_start_offsets)
+                    .build();
 
                 // if we have any cached results, connect them up
                 let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)

@@ -40,6 +40,8 @@ pub(super) struct DataRequest {
     ranges: Vec<Range<u64>>,
     /// Optional page start offsets for each requested range. This is used
     /// to create the relevant InMemoryRowGroup
+    ///
+    /// See [`FetchRanges::page_start_offsets`] for more details
     page_start_offsets: Option<Vec<Vec<u64>>>,
 }
 
@@ -70,6 +72,11 @@ impl DataRequest {
                 })
             })
             .collect()
+    }
+
+    /// Take the page_start_offsets, if any, and returns them
+    pub fn take_page_start_offsets(&mut self) -> Option<Vec<Vec<u64>>> {
+        self.page_start_offsets.take()
     }
 
     /// Create a new InMemoryRowGroup, and fill it with provided data

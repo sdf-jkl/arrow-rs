@@ -44,6 +44,9 @@ pub(crate) struct FetchRanges {
     /// The byte ranges to fetch
     pub(crate) ranges: Vec<Range<u64>>,
     /// If `Some`, the start offsets of each page for each column chunk
+    ///
+    /// `page_offsets[i][j]` corresponds to the start offset of page j in column
+    /// chunk `i`.
     pub(crate) page_start_offsets: Option<Vec<Vec<u64>>>,
 }
 
