@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Module for transforming a typed arrow `Array` to `VariantArray`.
+//! Shared conversion helpers for Variant-to-Arrow casting.
+//!
+//! This module is intentionally focused on small reusable building blocks used
+//! by [`crate::variant_to_arrow`], including:
+//! - extracting typed primitive/timestamp values from [`parquet_variant::Variant`]
+//! - strict/safe single-value cast semantics via [`variant_cast_with_options`]
+//! - decimal rescaling helpers via [`variant_to_unscaled_decimal`]
 
 use arrow::compute::{CastOptions, DecimalCast, rescale_decimal};
 use arrow::datatypes::{
@@ -55,6 +61,27 @@ pub(crate) fn variant_cast_with_options<'a, 'm, 'v, T>(
     } else {
         Err(ArrowError::CastError(format!(
             "Failed to cast variant value {variant:?}"
+        )))
+    }
+}
+
+/// Cast a single Arrow-to-Variant conversion result with safe/strict semantics.
+///
+/// Returns `Ok(value)` on successful conversion.
+/// Returns `Ok(Variant::Null)` when conversion fails in safe mode.
+/// Returns `Err(_)` when conversion fails in strict mode.
+pub(crate) fn arrow_cast_with_options<'a>(
+    value: Option<Variant<'a, 'a>>,
+    cast_options: &CastOptions<'_>,
+    index: usize,
+) -> Result<Variant<'a, 'a>> {
+    if let Some(value) = value {
+        Ok(value)
+    } else if cast_options.safe {
+        Ok(Variant::Null)
+    } else {
+        Err(ArrowError::ComputeError(format!(
+            "Failed to convert value at index {index}: conversion failed",
         )))
     }
 }
@@ -270,62 +297,3 @@ where
         _ => None,
     }
 }
-
-/// Convert the value at a specific index in the given array into a `Variant`.
-macro_rules! non_generic_conversion_single_value {
-    ($array:expr, $cast_fn:expr, $index:expr) => {{
-        let array = $array;
-        if array.is_null($index) {
-            Ok(Variant::Null)
-        } else {
-            let cast_value = $cast_fn(array.value($index));
-            Ok(Variant::from(cast_value))
-        }
-    }};
-}
-pub(crate) use non_generic_conversion_single_value;
-
-/// Convert the value at a specific index in the given array into a `Variant`,
-/// using `method` requiring a generic type to downcast the generic array
-/// to a specific array type and `cast_fn` to transform the element.
-macro_rules! generic_conversion_single_value {
-    ($t:ty, $method:ident, $cast_fn:expr, $input:expr, $index:expr) => {{
-        $crate::type_conversion::non_generic_conversion_single_value!(
-            $input.$method::<$t>(),
-            $cast_fn,
-            $index
-        )
-    }};
-}
-pub(crate) use generic_conversion_single_value;
-
-macro_rules! generic_conversion_single_value_with_result {
-    ($t:ty, $method:ident, $cast_fn:expr, $input:expr, $index:expr) => {{
-        let arr = $input.$method::<$t>();
-        let v = arr.value($index);
-        match ($cast_fn)(v) {
-            Ok(var) => Ok(Variant::from(var)),
-            Err(e) => Err(ArrowError::CastError(format!(
-                "Cast failed at index {idx} (array type: {ty}): {e}",
-                idx = $index,
-                ty = <$t as ::arrow::datatypes::ArrowPrimitiveType>::DATA_TYPE
-            ))),
-        }
-    }};
-}
-
-pub(crate) use generic_conversion_single_value_with_result;
-
-/// Convert the value at a specific index in the given array into a `Variant`.
-macro_rules! primitive_conversion_single_value {
-    ($t:ty, $input:expr, $index:expr) => {{
-        $crate::type_conversion::generic_conversion_single_value!(
-            $t,
-            as_primitive,
-            |v| v,
-            $input,
-            $index
-        )
-    }};
-}
-pub(crate) use primitive_conversion_single_value;

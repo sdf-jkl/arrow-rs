@@ -18,22 +18,13 @@
 //! [`VariantArray`] implementation
 
 use crate::VariantArrayBuilder;
-use crate::type_conversion::{
-    generic_conversion_single_value, generic_conversion_single_value_with_result,
-    primitive_conversion_single_value,
-};
+use crate::arrow_to_variant::primitive_arrow_value_to_variant;
 use arrow::array::{Array, ArrayRef, AsArray, BinaryViewArray, StructArray};
 use arrow::buffer::NullBuffer;
-use arrow::compute::cast;
-use arrow::datatypes::{
-    Date32Type, Decimal32Type, Decimal64Type, Decimal128Type, Float16Type, Float32Type,
-    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Time64MicrosecondType,
-    TimestampMicrosecondType, TimestampNanosecondType,
-};
+use arrow::compute::{CastOptions, cast};
 use arrow::error::Result;
 use arrow_schema::extension::ExtensionType;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, TimeUnit};
-use chrono::{DateTime, NaiveTime};
 use parquet_variant::{
     Uuid, Variant, VariantDecimal4, VariantDecimal8, VariantDecimal16, VariantDecimalType as _,
 };
@@ -944,159 +935,32 @@ fn typed_value_to_variant<'a>(
         // Only a partially shredded struct is allowed to have values for both columns
         panic!("Invalid variant, conflicting value and typed_value");
     }
-    match data_type {
-        DataType::Null => Ok(Variant::Null),
-        DataType::Boolean => {
-            let boolean_array = typed_value.as_boolean();
-            let value = boolean_array.value(index);
-            Ok(Variant::from(value))
-        }
-        // 16-byte FixedSizeBinary alway corresponds to a UUID; all other sizes are illegal.
-        DataType::FixedSizeBinary(16) => {
-            let array = typed_value.as_fixed_size_binary();
-            let value = array.value(index);
-            Ok(Uuid::from_slice(value).unwrap().into()) // unwrap is safe: slice is always 16 bytes
-        }
-        DataType::BinaryView => {
-            let array = typed_value.as_binary_view();
-            let value = array.value(index);
-            Ok(Variant::from(value))
-        }
-        DataType::Utf8 => {
-            let array = typed_value.as_string::<i32>();
-            let value = array.value(index);
-            Ok(Variant::from(value))
-        }
-        DataType::LargeUtf8 => {
-            let array = typed_value.as_string::<i64>();
-            let value = array.value(index);
-            Ok(Variant::from(value))
-        }
-        DataType::Utf8View => {
-            let array = typed_value.as_string_view();
-            let value = array.value(index);
-            Ok(Variant::from(value))
-        }
-        DataType::Int8 => {
-            primitive_conversion_single_value!(Int8Type, typed_value, index)
-        }
-        DataType::Int16 => {
-            primitive_conversion_single_value!(Int16Type, typed_value, index)
-        }
-        DataType::Int32 => {
-            primitive_conversion_single_value!(Int32Type, typed_value, index)
-        }
-        DataType::Int64 => {
-            primitive_conversion_single_value!(Int64Type, typed_value, index)
-        }
-        DataType::Float16 => {
-            primitive_conversion_single_value!(Float16Type, typed_value, index)
-        }
-        DataType::Float32 => {
-            primitive_conversion_single_value!(Float32Type, typed_value, index)
-        }
-        DataType::Float64 => {
-            primitive_conversion_single_value!(Float64Type, typed_value, index)
-        }
-        DataType::Decimal32(_, s) => {
-            generic_conversion_single_value_with_result!(
-                Decimal32Type,
-                as_primitive,
-                |v| VariantDecimal4::try_new(v, *s as u8),
-                typed_value,
-                index
-            )
-        }
-        DataType::Decimal64(_, s) => {
-            generic_conversion_single_value_with_result!(
-                Decimal64Type,
-                as_primitive,
-                |v| VariantDecimal8::try_new(v, *s as u8),
-                typed_value,
-                index
-            )
-        }
-        DataType::Decimal128(_, s) => {
-            generic_conversion_single_value_with_result!(
-                Decimal128Type,
-                as_primitive,
-                |v| VariantDecimal16::try_new(v, *s as u8),
-                typed_value,
-                index
-            )
-        }
-        DataType::Date32 => {
-            generic_conversion_single_value!(
-                Date32Type,
-                as_primitive,
-                |v| Date32Type::to_naive_date_opt(v).unwrap(),
-                typed_value,
-                index
-            )
-        }
-        DataType::Time64(TimeUnit::Microsecond) => {
-            generic_conversion_single_value_with_result!(
-                Time64MicrosecondType,
-                as_primitive,
-                |v| NaiveTime::from_num_seconds_from_midnight_opt(
-                    (v / 1_000_000) as u32,
-                    (v % 1_000_000) as u32 * 1000
-                )
-                .ok_or_else(|| format!("Invalid microsecond from midnight: {}", v)),
-                typed_value,
-                index
-            )
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
-            generic_conversion_single_value!(
-                TimestampMicrosecondType,
-                as_primitive,
-                |v| DateTime::from_timestamp_micros(v).unwrap(),
-                typed_value,
-                index
-            )
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            generic_conversion_single_value!(
-                TimestampMicrosecondType,
-                as_primitive,
-                |v| DateTime::from_timestamp_micros(v).unwrap().naive_utc(),
-                typed_value,
-                index
-            )
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
-            generic_conversion_single_value!(
-                TimestampNanosecondType,
-                as_primitive,
-                DateTime::from_timestamp_nanos,
-                typed_value,
-                index
-            )
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
-            generic_conversion_single_value!(
-                TimestampNanosecondType,
-                as_primitive,
-                |v| DateTime::from_timestamp_nanos(v).naive_utc(),
-                typed_value,
-                index
-            )
-        }
-        // todo other types here (note this is very similar to cast_to_variant.rs)
-        // so it would be great to figure out how to share this code
-        _ => {
-            // We shouldn't panic in production code, but this is a
-            // placeholder until we implement more types
-            // https://github.com/apache/arrow-rs/issues/8091
-            debug_assert!(
-                false,
-                "Unsupported typed_value type: {}",
-                typed_value.data_type()
-            );
-            Ok(Variant::Null)
-        }
+    // 16-byte FixedSizeBinary always corresponds to UUID in shredded typed_value.
+    if matches!(data_type, DataType::FixedSizeBinary(16)) {
+        let array = typed_value.as_fixed_size_binary();
+        let value = array.value(index);
+        return Ok(Uuid::from_slice(value).unwrap().into()); // unwrap is safe: slice is always 16 bytes
     }
+
+    let options = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    if let Some(variant) =
+        primitive_arrow_value_to_variant(data_type, typed_value.as_ref(), index, &options)?
+    {
+        return Ok(variant);
+    }
+
+    // We shouldn't panic in production code, but this is a
+    // placeholder until we implement more types
+    // https://github.com/apache/arrow-rs/issues/8091
+    debug_assert!(
+        false,
+        "Unsupported typed_value type: {}",
+        typed_value.data_type()
+    );
+    Ok(Variant::Null)
 }
 
 /// Workaround for lack of direct support for BinaryArray
@@ -1688,7 +1552,7 @@ mod test {
                 let result = array.try_value(0);
                 assert!(result.is_err());
                 let error = result.unwrap_err();
-                assert!(matches!(error, ArrowError::CastError(_)));
+                assert!(matches!(error, ArrowError::ComputeError(_)));
 
                 let expected: &str = $error_msg;
                 assert!(
@@ -1704,19 +1568,19 @@ mod test {
     invalid_variant_array_test!(
         test_variant_array_invalide_time,
         Time64MicrosecondArray::from(vec![Some(86401000000)]),
-        "Cast error: Cast failed at index 0 (array type: Time64(µs)): Invalid microsecond from midnight: 86401000000"
+        "Compute error: Failed to convert value at index 0: conversion failed"
     );
 
     invalid_variant_array_test!(
         test_variant_array_invalid_decimal32,
         Decimal32Array::from(vec![Some(1234567890)]),
-        "Cast error: Cast failed at index 0 (array type: Decimal32(9, 2)): Invalid argument error: 1234567890 is wider than max precision 9"
+        "Compute error: Failed to convert value at index 0: conversion failed"
     );
 
     invalid_variant_array_test!(
         test_variant_array_invalid_decimal64,
         Decimal64Array::from(vec![Some(1234567890123456789)]),
-        "Cast error: Cast failed at index 0 (array type: Decimal64(18, 6)): Invalid argument error: 1234567890123456789 is wider than max precision 18"
+        "Compute error: Failed to convert value at index 0: conversion failed"
     );
 
     invalid_variant_array_test!(
@@ -1724,6 +1588,6 @@ mod test {
         Decimal128Array::from(vec![Some(
             i128::from_str("123456789012345678901234567890123456789").unwrap()
         ),]),
-        "Cast error: Cast failed at index 0 (array type: Decimal128(38, 10)): Invalid argument error: 123456789012345678901234567890123456789 is wider than max precision 38"
+        "Compute error: Failed to convert value at index 0: conversion failed"
     );
 }
