@@ -47,8 +47,8 @@ struct AlpEncodedVectorView<Exact: AlpExact> {
 
 impl<Exact: AlpExact> AlpEncodedVectorView<Exact> {
     fn expected_stored_size(&self) -> usize {
-        AlpInfo::STORED_SIZE
-            + ForInfo::<Exact>::stored_size()
+        AlpInfo::SERIALIZED_SIZE
+            + ForInfo::<Exact>::serialized_size()
             + self
                 .for_info
                 .get_data_stored_size(self.num_elements, self.alp_info.num_exceptions)
@@ -239,7 +239,7 @@ fn parse_vector_view<Exact: AlpExact>(
 ) -> Result<AlpEncodedVectorView<Exact>> {
     let vector_bytes = &body[vector_start..vector_end];
 
-    let metadata_size = AlpInfo::STORED_SIZE + ForInfo::<Exact>::stored_size();
+    let metadata_size = AlpInfo::SERIALIZED_SIZE + ForInfo::<Exact>::serialized_size();
     if vector_bytes.len() < metadata_size {
         return Err(general_err!(
             "Invalid ALP page: vector metadata too short, expected at least {} bytes, got {}",
@@ -284,7 +284,7 @@ fn parse_vector_view<Exact: AlpExact>(
         ));
     }
 
-    let for_start = AlpInfo::STORED_SIZE;
+    let for_start = AlpInfo::SERIALIZED_SIZE;
     let for_end = for_start + Exact::WIDTH;
     let frame_of_reference = Exact::from_le_slice(&vector_bytes[for_start..for_end]);
     let bit_width = vector_bytes[for_end];

@@ -53,6 +53,9 @@ pub(crate) struct AlpHeader {
 }
 
 impl AlpHeader {
+    /// Size of the header. in bytes
+    pub(crate) const SERIALIZED_SIZE: usize = 7;
+
     pub(crate) fn num_elements_usize(&self) -> usize {
         self.num_elements as usize
     }
@@ -81,6 +84,16 @@ impl AlpHeader {
             0
         }
     }
+
+    /// Encodes the header fields into the provided byte slice.
+    pub(crate) fn serialize(&self, dst: &mut [u8]) {
+        dst[0..2].copy_from_slice(&[
+            ALP_COMPRESSION_MODE,
+            ALP_INTEGER_ENCODING_FOR_BIT_PACK,
+            self.log_vector_size,
+        ]);
+        dst[3..7].copy_from_slice(&self.num_elements.to_le_bytes());
+    }
 }
 
 /// Per-vector ALP metadata (4 bytes), equivalent to C++ `AlpEncodedVectorInfo`.
@@ -102,7 +115,22 @@ pub(crate) struct AlpInfo {
 }
 
 impl AlpInfo {
-    pub(crate) const STORED_SIZE: usize = 4;
+    pub(crate) const SERIALIZED_SIZE: usize = 4;
+
+    fn new(exponent: u8, factor: u8, num_exceptions: u16) -> Self {
+        Self {
+            exponent,
+            factor,
+            num_exceptions,
+        }
+    }
+
+    /// Encodes the header fields into the provided byte slice.
+    pub(crate) fn serialize(&self, dst: &mut [u8]) {
+        dst[0] = self.exponent;
+        dst[1] = self.factor;
+        dst[2..4].copy_from_slice(&self.num_exceptions.to_le_bytes());
+    }
 }
 
 /// Per-vector FOR metadata for exact integer type (`u32` for `f32`, `u64` for `f64`).
@@ -119,14 +147,27 @@ impl AlpInfo {
 /// +----+----+----+----+-----------+
 /// ```
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ForInfo<Exact: AlpExact> {
-    pub(crate) frame_of_reference: Exact,
+pub(crate) struct ForInfo<T: AlpExact> {
+    pub(crate) frame_of_reference: T,
     pub(crate) bit_width: u8,
 }
 
-impl<Exact: AlpExact> ForInfo<Exact> {
-    pub(crate) fn stored_size() -> usize {
-        Exact::WIDTH + 1
+impl<T: AlpExact> ForInfo<T> {
+    pub(crate) fn serialized_size() -> usize {
+        T::WIDTH + 1
+    }
+
+    fn new(frame_of_reference: T, bit_width: u8) -> Self {
+        Self {
+            frame_of_reference,
+            bit_width,
+        }
+    }
+
+    pub(crate) fn serialize(&self, dst: &mut [u8]) {
+        let for_len = T::WIDTH;
+        self.frame_of_reference.write_le_bytes(&mut dst[0..for_len]);
+        dst[for_len] = self.bit_width;
     }
 
     pub(crate) fn get_bit_packed_size(&self, num_elements: u16) -> usize {
@@ -137,7 +178,7 @@ impl<Exact: AlpExact> ForInfo<Exact> {
         let bit_packed_size = self.get_bit_packed_size(num_elements);
         bit_packed_size
             + num_exceptions as usize * std::mem::size_of::<u16>()
-            + num_exceptions as usize * Exact::WIDTH
+            + num_exceptions as usize * T::WIDTH
     }
 }
 
@@ -155,6 +196,9 @@ pub(crate) trait AlpExact: Copy + std::fmt::Debug + FromBitpacked {
     const WIDTH: usize;
     type Signed: Copy;
     fn from_le_slice(slice: &[u8]) -> Self;
+    /// Write `Self` as little-endian bytes into `dst`.
+    /// `dst` must be at least `Self::WIDTH` bytes long.
+    fn write_le_bytes(self, dst: &mut [u8]);
     fn zero() -> Self;
     fn wrapping_add(self, rhs: Self) -> Self;
     fn reinterpret_as_signed(self) -> Self::Signed;
@@ -166,6 +210,10 @@ impl AlpExact for u32 {
 
     fn from_le_slice(slice: &[u8]) -> Self {
         u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]])
+    }
+
+    fn write_le_bytes(self, dst: &mut [u8]) {
+        dst.copy_from_slice(&self.to_le_bytes());
     }
 
     fn zero() -> Self {
@@ -189,6 +237,10 @@ impl AlpExact for u64 {
         u64::from_le_bytes([
             slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
         ])
+    }
+
+    fn write_le_bytes(self, dst: &mut [u8]) {
+        dst.copy_from_slice(&self.to_le_bytes());
     }
 
     fn zero() -> Self {

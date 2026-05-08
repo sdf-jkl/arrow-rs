@@ -3014,14 +3014,13 @@ mod tests {
     ];
     #[test]
     fn f32_decimal_like_single_column() {
-        required_and_optional::<Float32Array, _>(DECIMAL_LIKE_VALUES.iter().map(|f| *f));
+        required_and_optional::<Float32Array, _>(DECIMAL_LIKE_VALUES.iter().copied());
     }
 
     #[test]
     fn f64_decimal_like_single_column() {
         required_and_optional::<Float64Array, _>(DECIMAL_LIKE_VALUES.iter().map(|f| *f as f64));
     }
-
 
     // The timestamp array types don't implement From<Vec<T>> because they need the timezone
     // argument, and they also doesn't support building from a Vec<Option<T>>, so call
