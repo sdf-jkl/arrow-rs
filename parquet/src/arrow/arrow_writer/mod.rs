@@ -2759,7 +2759,7 @@ mod tests {
                 Encoding::BYTE_STREAM_SPLIT,
             ],
             DataType::Float32 | DataType::Float64 => {
-                vec![Encoding::PLAIN, Encoding::BYTE_STREAM_SPLIT]
+                vec![Encoding::PLAIN, Encoding::BYTE_STREAM_SPLIT, Encoding::ALP]
             }
             _ => vec![Encoding::PLAIN],
         };
@@ -2999,6 +2999,29 @@ mod tests {
     fn f64_single_column() {
         required_and_optional::<Float64Array, _>((0..SMALL_SIZE).map(|i| i as f64));
     }
+
+    // "Decimal Like" floating point values
+    const DECIMAL_LIKE_VALUES: [f32; 9] = [
+        1.23,
+        4.56,
+        5.56,
+        f32::NAN,
+        f32::NEG_INFINITY,
+        f32::INFINITY,
+        f32::INFINITY,
+        7.89,
+        0.12,
+    ];
+    #[test]
+    fn f32_decimal_like_single_column() {
+        required_and_optional::<Float32Array, _>(DECIMAL_LIKE_VALUES.iter().map(|f| *f));
+    }
+
+    #[test]
+    fn f64_decimal_like_single_column() {
+        required_and_optional::<Float64Array, _>(DECIMAL_LIKE_VALUES.iter().map(|f| *f as f64));
+    }
+
 
     // The timestamp array types don't implement From<Vec<T>> because they need the timezone
     // argument, and they also doesn't support building from a Vec<Option<T>>, so call
