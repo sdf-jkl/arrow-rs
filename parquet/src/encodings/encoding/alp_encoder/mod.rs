@@ -29,7 +29,7 @@ use bytes::Bytes;
 use std::fmt::Formatter;
 
 use super::Encoder;
-use vector::{InProgressVector, VectorFinishResult, VectorPutResult};
+use vector::{InProgressVector, VectorFinishResult, VectorPutResult, EncodingParams};
 
 /// Vector size in bits
 const ALP_LOG_VECTOR_SIZE: u8 = 10;
@@ -80,6 +80,8 @@ enum VectorState<T> {
 
 /// Buffers to reuse for next vector
 struct Scratch<T> {
+    /// Encoding parameters (maybe not known until we see a sample of the data)
+    encoding_params: Option<EncodingParams>,
     exception_positions: Vec<usize>,
     exception_values: Vec<T>,
 }
@@ -114,6 +116,7 @@ where
         let mut buffer = vec![0; AlpHeader::SERIALIZED_SIZE];
 
         let scratch = Scratch {
+            encoding_params: None,
             exception_positions: Vec::with_capacity(expected_num_values),
             exception_values: Vec::with_capacity(expected_num_values),
         };
