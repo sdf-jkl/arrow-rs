@@ -87,7 +87,7 @@ impl AlpHeader {
 
     /// Encodes the header fields into the provided byte slice.
     pub(crate) fn serialize(&self, dst: &mut [u8]) {
-        dst[0..2].copy_from_slice(&[
+        dst[0..3].copy_from_slice(&[
             ALP_COMPRESSION_MODE,
             ALP_INTEGER_ENCODING_FOR_BIT_PACK,
             self.log_vector_size,
@@ -117,7 +117,7 @@ pub(crate) struct AlpInfo {
 impl AlpInfo {
     pub(crate) const SERIALIZED_SIZE: usize = 4;
 
-    fn new(exponent: u8, factor: u8, num_exceptions: u16) -> Self {
+    pub(crate) fn new(exponent: u8, factor: u8, num_exceptions: u16) -> Self {
         Self {
             exponent,
             factor,
@@ -157,7 +157,7 @@ impl<T: AlpExact> ForInfo<T> {
         T::WIDTH + 1
     }
 
-    fn new(frame_of_reference: T, bit_width: u8) -> Self {
+    pub(crate) fn new(frame_of_reference: T, bit_width: u8) -> Self {
         Self {
             frame_of_reference,
             bit_width,
@@ -192,7 +192,7 @@ impl<T: AlpExact> ForInfo<T> {
 /// - FOR stores non-negative deltas optimized for bitpacking.
 /// - Unsigned arithmetic avoids signed-overflow edge cases in FOR stage.
 /// - Signed interpretation is applied later during decimal reconstruction.
-pub(crate) trait AlpExact: Copy + std::fmt::Debug + FromBitpacked {
+pub(crate) trait AlpExact: Default + Copy + std::fmt::Debug + FromBitpacked {
     const WIDTH: usize;
     type Signed: Copy;
     fn from_le_slice(slice: &[u8]) -> Self;

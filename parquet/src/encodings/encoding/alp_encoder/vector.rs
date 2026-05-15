@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::encodings::alp::{AlpFloat, AlpInfo};
+use crate::errors::{ParquetError, Result};
+use crate::encodings::alp::{AlpFloat, AlpInfo, ForInfo};
 use crate::encodings::encoding::alp_encoder::{ALP_VECTOR_SIZE, Scratch};
 use std::mem;
 
@@ -56,13 +57,16 @@ pub(super) struct InProgressVector<F> {
     /// Start position of the vector in the page (points to AlpInfo)
     start_pos: usize,
     /// Number of values in the vector so far
-    count: usize,
+    vector_len: usize,
     /// Encoding parameters (maybe not known until we see a sample of the data)
     encoding_params: Option<EncodingParams>,
-    /// positions of values in exception_values in original vector
-    exception_positions: Vec<usize>,
+    /// positions of values in exception_values in original vector. u16 so
+    /// we can copy them directly to the output.
+    exception_positions: Vec<u16>,
+    /// TODO can avoid this copy when we have an entire vector.
     /// values that could not be encoded
     /// or are being accumulated before the page is done
+    /// Since we don't know how many exceptions there will be we buffer them here until the end of the vector, then write them all at once to the output buffer.
     exception_values: Vec<F>,
 }
 
@@ -85,12 +89,12 @@ impl<F: AlpFloat> InProgressVector<F> {
         // reserve space for the header. ForInfo is `frame_of_reference`
         // (4 bytes for f32 / 8 bytes for f64 — same as `T::get_type_size()`)
         // plus a 1-byte `bit_width`.
-        let header_len = AlpInfo::SERIALIZED_SIZE + mem::size_of::<F>() + 1;
+        let header_len = AlpInfo::SERIALIZED_SIZE + ForInfo::<F::Exact>::serialized_size();
         buffer.resize(buffer.len() + header_len, 0);
 
         InProgressVector {
             start_pos,
-            count: 0,
+            vector_len: 0,
             encoding_params,
             exception_positions,
             exception_values,
@@ -105,7 +109,7 @@ impl<F: AlpFloat> InProgressVector<F> {
         mut self,
         dst: &mut Vec<u8>,
         values: &[F],
-    ) -> crate::errors::Result<VectorPutResult<F>> {
+    ) -> Result<VectorPutResult<F>> {
 
 
         // Phase 1: Determine encoding parameters from first batch if needed
@@ -115,19 +119,21 @@ impl<F: AlpFloat> InProgressVector<F> {
             .unwrap_or_else(|| EncodingParams::from_sample(values));
 
         // If we can encode an entire vector do so
-        let space_left = ALP_VECTOR_SIZE - self.count;
+        let space_left = ALP_VECTOR_SIZE - self.vector_len;
         let num_to_encode  = values.len().min(ALP_VECTOR_SIZE).min(space_left);
 
         // TODO: actually encode that many values (TODO)
         // for now just treat them all as exceptions
         self.exception_values.extend(&values[0..num_to_encode]);
-            self.exception_positions
-                .extend(self.count..(self.count + num_to_encode));
+
+        // TODO check overflow
+        let vector_len = self.vector_len as u16;
+        self.exception_positions.extend(vector_len..vector_len + num_to_encode as u16);
 
         // Update counters
-        self.count += num_to_encode;
+        self.vector_len += num_to_encode;
         self.encoding_params = Some(encoding_params);
-        if self.count < ALP_VECTOR_SIZE {
+        if self.vector_len < ALP_VECTOR_SIZE {
             Ok(VectorPutResult::StillInProgress(self))
         } else {
             Ok(VectorPutResult::Finished {
@@ -141,9 +147,50 @@ impl<F: AlpFloat> InProgressVector<F> {
     pub(super) fn finish(
         self,
         dst: &mut Vec<u8>,
-    ) -> crate::errors::Result<VectorFinishResult<F>> {
-        todo!();
-        // TODO; finalize the header
+    ) -> Result<VectorFinishResult<F>> {
+        let Self{ start_pos, vector_len, encoding_params, exception_positions, exception_values } = self;
+
+        // If we had no encoding parameters, no values were written (zero length vector)
+        let Some(encoding_params) = encoding_params else {
+            return Err(general_err!("Internal error: ALP Vector finished with no values written"));
+        };
+
+        // Output is like this (starting at start_pos) (see diagram on InProgressVector)
+        // AlpInfo
+        // ForInfo
+        // PackedValues (already written)
+        // ExceptionPositions (write from exception_positions)
+        // ExceptionValues (write from exception_values)
+
+        let num_exceptions = exception_values.len();
+        let num_exceptions: u16 = num_exceptions.try_into()
+            .map_err(|_| general_err!("More than u16::MAX exceptions in ALP Vector: {num_exceptions}"))?;
+
+        // TODO move ALPInfo and FOR creation into the encoding params
+        let alp_info = AlpInfo::new(encoding_params.exponent, encoding_params.factor, num_exceptions);
+        alp_info.serialize(&mut dst[start_pos..]);
+        let frame_of_reference = Default::default();
+        let bit_width = 0; // TODO actually compute bitwidth (from encoding params)
+        let for_info = ForInfo::<F::Exact>::new(frame_of_reference, bit_width);
+        for_info.serialize(&mut dst[start_pos + AlpInfo::SERIALIZED_SIZE..]);
+
+        // ExceptionPositions (all uint16)
+        // TODO make this faster
+        dst.extend(exception_positions.iter().flat_map(|pos| pos.to_le_bytes()));
+        // ExceptionValues (all T)
+        //dst.extend(exception_values.iter().flat_map(|val| val.to_le_bytes()));
+        // temp just write zeros (the traits are getting messy)
+        let num_bytes = exception_values.len() * mem::size_of::<F::Exact>();
+        dst.extend(std::iter::repeat(0).take(num_bytes));
+
+        Ok(VectorFinishResult {
+            vector_len,
+            scratch: Scratch {
+                encoding_params: Some(encoding_params),
+                exception_positions,
+                exception_values,
+            },
+        })
     }
 }
 

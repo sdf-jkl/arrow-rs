@@ -82,7 +82,7 @@ enum VectorState<T> {
 struct Scratch<T> {
     /// Encoding parameters (maybe not known until we see a sample of the data)
     encoding_params: Option<EncodingParams>,
-    exception_positions: Vec<usize>,
+    exception_positions: Vec<u16>,
     exception_values: Vec<T>,
 }
 
