@@ -93,6 +93,7 @@ tokio = { version = "1.0", default-features = false, features = ["macros", "rt-m
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"] }
 object_store = { workspace = true, features = ["azure", "fs"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+fastlanes = "0.5"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -260,6 +261,11 @@ harness = false
 [[bench]]
 name = "encoding"
 required-features = ["experimental", "default"]
+harness = false
+
+[[bench]]
+name = "alp_ffor_fastlanes"
+required-features = ["experimental"]
 harness = false
 
 [[bench]]
