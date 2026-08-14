@@ -18,6 +18,7 @@
 mod alp;
 pub mod decoding;
 pub mod encoding;
+pub(crate) mod fastlanes;
 pub mod levels;
 
 experimental!(pub(crate) mod rle);

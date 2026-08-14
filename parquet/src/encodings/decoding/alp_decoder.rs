@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::marker::PhantomData;
 use std::ops::Range;
 
 use bytes::Bytes;
@@ -23,11 +24,12 @@ use crate::basic::Encoding;
 use crate::data_type::DataType;
 use crate::encodings::alp::{
     ALP_COMPRESSION_MODE, ALP_DEFAULT_LOG_VECTOR_SIZE, ALP_HEADER_SIZE,
-    ALP_INTEGER_ENCODING_FOR_BIT_PACK, ALP_MAX_EXPONENT_F32, ALP_MAX_EXPONENT_F64,
-    ALP_MAX_LOG_VECTOR_SIZE, ALP_MIN_LOG_VECTOR_SIZE, AlpExact, AlpFloat, AlpHeader, AlpInfo,
-    ForInfo,
+    ALP_INTEGER_ENCODING_FASTLANES, ALP_INTEGER_ENCODING_FOR_BIT_PACK, ALP_MAX_EXPONENT_F32,
+    ALP_MAX_EXPONENT_F64, ALP_MAX_LOG_VECTOR_SIZE, ALP_MIN_LOG_VECTOR_SIZE, AlpExact, AlpFloat,
+    AlpHeader, AlpInfo, ForInfo,
 };
 use crate::encodings::decoding::Decoder;
+use crate::encodings::fastlanes::FastLanesBitPacking;
 use crate::errors::{ParquetError, Result};
 use crate::util::bit_util::BitReader;
 
@@ -41,9 +43,9 @@ use crate::util::bit_util::BitReader;
 /// stored.
 #[derive(Debug, Clone, Copy)]
 struct AlpEncodedVectorView<Exact: AlpExact> {
-    num_elements: u16,
     alp_info: AlpInfo,
     for_info: ForInfo<Exact>,
+    packed_values_len: usize,
     packed_values: usize,
     exception_positions: usize,
     exception_values: usize,
@@ -53,15 +55,14 @@ impl<Exact: AlpExact> AlpEncodedVectorView<Exact> {
     fn expected_stored_size(&self) -> usize {
         AlpInfo::STORED_SIZE
             + ForInfo::<Exact>::stored_size()
-            + self
-                .for_info
-                .get_data_stored_size(self.num_elements, self.alp_info.num_exceptions)
+            + self.packed_values_len
+            + self.alp_info.num_exceptions as usize * std::mem::size_of::<u16>()
+            + self.alp_info.num_exceptions as usize * Exact::WIDTH
     }
 
     /// Byte range of the bit-packed values section in the page body.
     fn packed_values_range(&self) -> Range<usize> {
-        let len = self.for_info.get_bit_packed_size(self.num_elements);
-        self.packed_values..self.packed_values + len
+        self.packed_values..self.packed_values + self.packed_values_len
     }
 
     /// Byte range of the exception positions section (`u16` each) in the page body.
@@ -88,7 +89,9 @@ fn parse_alp_page_header(data: &[u8]) -> Result<AlpHeader> {
             header.compression_mode
         ));
     }
-    if header.integer_encoding != ALP_INTEGER_ENCODING_FOR_BIT_PACK {
+    let supported_integer_encoding = header.integer_encoding == ALP_INTEGER_ENCODING_FOR_BIT_PACK
+        || header.integer_encoding == ALP_INTEGER_ENCODING_FASTLANES;
+    if !supported_integer_encoding {
         return Err(general_err!(
             "Invalid ALP page: unsupported integer encoding {}",
             header.integer_encoding
@@ -106,6 +109,14 @@ fn parse_alp_page_header(data: &[u8]) -> Result<AlpHeader> {
             "Invalid ALP page: log_vector_size {} exceeds max {}",
             header.vector_size.trailing_zeros(),
             ALP_MAX_LOG_VECTOR_SIZE
+        ));
+    }
+    if header.integer_encoding == ALP_INTEGER_ENCODING_FASTLANES
+        && header.vector_size != (1usize << ALP_DEFAULT_LOG_VECTOR_SIZE)
+    {
+        return Err(general_err!(
+            "Invalid ALP page: FastLanes integer encoding requires vector size {}",
+            1usize << ALP_DEFAULT_LOG_VECTOR_SIZE
         ));
     }
 
@@ -129,6 +140,8 @@ fn parse_vector_view<Exact: AlpExact>(
     vector_start: usize,
     vector_end: usize,
     num_elements: u16,
+    integer_encoding: u8,
+    vector_size: usize,
 ) -> Result<AlpEncodedVectorView<Exact>> {
     let vector_bytes = &body[vector_start..vector_end];
 
@@ -195,7 +208,19 @@ fn parse_vector_view<Exact: AlpExact>(
         bit_width,
     };
 
-    let data_size = for_info.get_data_stored_size(num_elements, alp_info.num_exceptions);
+    let is_fastlanes = integer_encoding == ALP_INTEGER_ENCODING_FASTLANES;
+    let packed_size = if is_fastlanes {
+        vector_size * bit_width as usize / 8
+    } else {
+        for_info.get_bit_packed_size(num_elements)
+    };
+    let data_size = if is_fastlanes {
+        packed_size
+            + alp_info.num_exceptions as usize * std::mem::size_of::<u16>()
+            + alp_info.num_exceptions as usize * Exact::WIDTH
+    } else {
+        for_info.get_data_stored_size(num_elements, alp_info.num_exceptions)
+    };
     let expected_size = metadata_size + data_size;
     if vector_bytes.len() < expected_size {
         return Err(general_err!(
@@ -213,7 +238,6 @@ fn parse_vector_view<Exact: AlpExact>(
     }
 
     let data = &vector_bytes[metadata_size..expected_size];
-    let packed_size = for_info.get_bit_packed_size(num_elements);
     let positions_size = alp_info.num_exceptions as usize * std::mem::size_of::<u16>();
 
     // Section offsets relative to the start of the data section: packed values
@@ -243,9 +267,9 @@ fn parse_vector_view<Exact: AlpExact>(
     let exception_values = data_start + values_start;
 
     Ok(AlpEncodedVectorView {
-        num_elements,
         alp_info,
         for_info,
+        packed_values_len: packed_size,
         packed_values,
         exception_positions,
         exception_values,
@@ -254,13 +278,29 @@ fn parse_vector_view<Exact: AlpExact>(
 
 /// Live decode state for the one vector currently being consumed.
 ///
-/// Holds the bit position inside that vector's packed values plus the
-/// vector-level constants needed to turn each packed integer back into a float.
-/// `delivered` is the vector-local index of the next element to produce, so
-/// exception patches (which use vector-local positions) land in the right place
-/// even when a vector is split across several `get`/`skip` calls.
+/// Holds the selected packed layout plus the vector-level constants needed to
+/// turn each packed integer back into a float. `delivered` is the vector-local
+/// index of the next element to produce, so both FastLanes point lookups and
+/// exception patches land in the right place when a vector is split across
+/// several `get`/`skip` calls.
+enum PackedValues<Exact> {
+    BitPacked(BitReader, PhantomData<Exact>),
+    FastLanes(Bytes, PhantomData<Exact>),
+}
+
+impl<Exact> PackedValues<Exact> {
+    fn skip(&mut self, num_values: usize, bit_width: usize) {
+        match self {
+            Self::BitPacked(reader, _) => {
+                reader.skip(num_values, bit_width);
+            }
+            Self::FastLanes(_, _) => {}
+        }
+    }
+}
+
 struct CurrentVector<Value: AlpFloat> {
-    reader: BitReader,
+    packed_values: PackedValues<Value::Exact>,
     bit_width: u8,
     frame_of_reference: Value::Exact,
     scale: Value::Scale,
@@ -275,9 +315,9 @@ struct CurrentVector<Value: AlpFloat> {
 /// Largest slice decoded in one unpack-then-decode pass: the canonical ALP
 /// vector size - 1024.
 ///
-/// The unpack scratch is sized to `min(vector_size, this)`, so vectors at the
-/// default size or smaller are decoded whole, while larger (non-default) vectors
-/// are decoded in canonical-vector-sized tiles.
+/// The standard unpack scratch is sized to `min(vector_size, this)`, while the
+/// FastLanes layout always uses one complete 1024-value scratch vector. Larger
+/// non-default standard vectors are decoded in canonical-vector-sized tiles.
 ///
 /// Bounding the tile to one canonical vector keeps the scratch L1-resident, which
 /// is what makes the staged unpack-then-decode beat an in-place decode.
@@ -287,11 +327,11 @@ const DECODE_TILE_CAP: usize = 1 << ALP_DEFAULT_LOG_VECTOR_SIZE;
 /// patching any exceptions whose vector-local position falls in the
 /// just-produced sub-range.
 ///
-/// Deltas are bulk-unpacked a tile at a time into the caller-provided `scratch`
-/// via `get_batch` (which dispatches to the SIMD-friendly fixed-width `unpack`
-/// kernels), then the inverse FOR and decimal decode run as one branchless,
-/// state-free loop over that contiguous tile so the compiler can autovectorize
-/// it.
+/// Standard deltas are bulk-unpacked a tile at a time via `get_batch`.
+/// FastLanes uses its bulk unpack for bulk reads and its direct single-value
+/// path for small reads. Both layouts apply inverse FOR and decimal
+/// reconstruction in the same loop so this comparison only changes the packed
+/// layout and unpacking kernel.
 fn decode_range<Value: AlpFloat>(
     cur: &mut CurrentVector<Value>,
     scratch: &mut [Value::Exact],
@@ -305,19 +345,59 @@ fn decode_range<Value: AlpFloat>(
     } else {
         let bit_width = cur.bit_width as usize;
         let scale = cur.scale;
-        for chunk in out.chunks_mut(scratch.len()) {
-            let deltas = &mut scratch[..chunk.len()];
-            let unpacked = cur.reader.get_batch::<Value::Exact>(deltas, bit_width);
-            if unpacked != chunk.len() {
-                return Err(general_err!(
-                    "Invalid ALP page: not enough packed bits to decode vector"
-                ));
+        match &mut cur.packed_values {
+            PackedValues::BitPacked(reader, _) => {
+                for chunk in out.chunks_mut(scratch.len()) {
+                    let deltas = &mut scratch[..chunk.len()];
+                    let unpacked = reader.get_batch::<Value::Exact>(deltas, bit_width);
+                    if unpacked != chunk.len() {
+                        return Err(general_err!(
+                            "Invalid ALP page: not enough packed bits to decode vector"
+                        ));
+                    }
+                    for (slot, &delta) in chunk.iter_mut().zip(deltas.iter()) {
+                        let signed = delta
+                            .wrapping_add(frame_of_reference)
+                            .reinterpret_as_signed();
+                        *slot = Value::decode_value(signed, scale);
+                    }
+                }
             }
-            for (slot, &delta) in chunk.iter_mut().zip(deltas.iter()) {
-                let signed = delta
-                    .wrapping_add(frame_of_reference)
-                    .reinterpret_as_signed();
-                *slot = Value::decode_value(signed, scale);
+            PackedValues::FastLanes(packed, _) => {
+                // Point lookups are a first-class ALP use case. Avoid unpacking
+                // all 1024 integers when a caller asks for only a small range;
+                // larger reads use FastLanes' bulk unpack.
+                if out.len() < 16 {
+                    for (offset, slot) in out.iter_mut().enumerate() {
+                        // `packed` is a validated full FastLanes vector and
+                        // `delivered + offset < 1024`.
+                        let delta = <Value::Exact as FastLanesBitPacking>::unpack_single_bytes(
+                            bit_width,
+                            packed.as_ref(),
+                            cur.delivered + offset,
+                        );
+                        *slot = Value::decode_value(
+                            delta
+                                .wrapping_add(frame_of_reference)
+                                .reinterpret_as_signed(),
+                            scale,
+                        );
+                    }
+                } else {
+                    debug_assert_eq!(scratch.len(), DECODE_TILE_CAP);
+                    <Value::Exact as FastLanesBitPacking>::unpack_bytes(
+                        bit_width,
+                        packed.as_ref(),
+                        scratch,
+                    );
+                    let deltas = &scratch[cur.delivered..cur.delivered + out.len()];
+                    for (slot, &delta) in out.iter_mut().zip(deltas) {
+                        let signed = delta
+                            .wrapping_add(frame_of_reference)
+                            .reinterpret_as_signed();
+                        *slot = Value::decode_value(signed, scale);
+                    }
+                }
             }
         }
     }
@@ -329,7 +409,10 @@ fn decode_range<Value: AlpFloat>(
     let hi = cur.delivered + out.len();
     // Both buffers were sliced to exactly `num_exceptions` whole entries at
     // parse time. A mismatch here would make `zip` silently drop exceptions.
-    debug_assert_eq!(cur.exception_positions.len() % std::mem::size_of::<u16>(), 0);
+    debug_assert_eq!(
+        cur.exception_positions.len() % std::mem::size_of::<u16>(),
+        0
+    );
     debug_assert_eq!(cur.exception_values.len() % Value::Exact::WIDTH, 0);
     debug_assert_eq!(
         cur.exception_positions.len() / std::mem::size_of::<u16>(),
@@ -436,16 +519,28 @@ where
         }
 
         let count = self.header.vector_num_elements(idx);
-        let view = parse_vector_view::<<T::T as AlpFloat>::Exact>(body_ref, start, end, count)?;
+        let view = parse_vector_view::<<T::T as AlpFloat>::Exact>(
+            body_ref,
+            start,
+            end,
+            count,
+            self.header.integer_encoding,
+            self.header.vector_size,
+        )?;
 
         // The next vector must start exactly where this one ends.
         self.expected_next_offset = start + view.expected_stored_size();
 
         let packed = self.body.slice(view.packed_values_range());
+        let packed_values = if self.header.integer_encoding == ALP_INTEGER_ENCODING_FASTLANES {
+            PackedValues::FastLanes(packed, PhantomData)
+        } else {
+            PackedValues::BitPacked(BitReader::new(packed), PhantomData)
+        };
         let exception_positions = self.body.slice(view.exception_positions_range());
         let exception_values = self.body.slice(view.exception_values_range());
         self.current = Some(CurrentVector {
-            reader: BitReader::new(packed),
+            packed_values,
             bit_width: view.for_info.bit_width,
             frame_of_reference: view.for_info.frame_of_reference,
             scale: <T::T as AlpFloat>::decode_scale(view.alp_info.exponent, view.alp_info.factor),
@@ -501,11 +596,15 @@ where
         // and to the page's value count so tiny pages don't over-allocate. The
         // `.max(1)` keeps a non-empty tile so the `chunks_mut` decode never hits a
         // zero stride (an empty page returns before any decode anyway).
-        let tile = header
-            .vector_size
-            .min(DECODE_TILE_CAP)
-            .min(num_values)
-            .max(1);
+        let tile = if header.integer_encoding == ALP_INTEGER_ENCODING_FASTLANES {
+            DECODE_TILE_CAP
+        } else {
+            header
+                .vector_size
+                .min(DECODE_TILE_CAP)
+                .min(num_values)
+                .max(1)
+        };
         self.scratch.clear();
         self.scratch.resize(tile, Default::default());
 
@@ -565,7 +664,7 @@ where
         if let Some(cur) = self.current.as_mut() {
             let within = left.min(cur.remaining);
             if cur.bit_width != 0 {
-                cur.reader.skip(within, cur.bit_width as usize);
+                cur.packed_values.skip(within, cur.bit_width as usize);
             }
             cur.delivered += within;
             cur.remaining -= within;
@@ -603,7 +702,7 @@ where
             self.load_current_vector()?;
             let cur = self.current.as_mut().unwrap();
             if cur.bit_width != 0 {
-                cur.reader.skip(within, cur.bit_width as usize);
+                cur.packed_values.skip(within, cur.bit_width as usize);
             }
             cur.delivered = within;
             cur.remaining -= within;
@@ -846,12 +945,29 @@ mod tests {
     }
 
     #[test]
-    fn test_set_data_rejects_integer_encoding() {
-        let data = make_alp_page_bytes(0, 1, 3, 1, &[4], 8);
+    fn test_set_data_rejects_fastlanes_non_default_vector_size() {
+        let data = make_alp_page_bytes(
+            ALP_COMPRESSION_MODE,
+            ALP_INTEGER_ENCODING_FASTLANES,
+            ALP_DEFAULT_LOG_VECTOR_SIZE - 1,
+            1,
+            &[4],
+            8,
+        );
         let err = decode_err::<DoubleType>(data, 1);
         assert!(
             err.to_string()
-                .contains("Invalid ALP page: unsupported integer encoding 1")
+                .contains("FastLanes integer encoding requires vector size 1024")
+        );
+    }
+
+    #[test]
+    fn test_set_data_rejects_integer_encoding() {
+        let data = make_alp_page_bytes(0, 2, 3, 1, &[4], 8);
+        let err = decode_err::<DoubleType>(data, 1);
+        assert!(
+            err.to_string()
+                .contains("Invalid ALP page: unsupported integer encoding 2")
         );
     }
 
@@ -1120,8 +1236,15 @@ mod tests {
         vector.extend_from_slice(&42.5_f64.to_le_bytes());
 
         let body = Bytes::from(vector);
-        let view = parse_vector_view::<u64>(body.as_ref(), 0, body.len(), 1).unwrap();
-        assert_eq!(view.num_elements, 1);
+        let view = parse_vector_view::<u64>(
+            body.as_ref(),
+            0,
+            body.len(),
+            1,
+            ALP_INTEGER_ENCODING_FOR_BIT_PACK,
+            8,
+        )
+        .unwrap();
         assert_eq!(view.alp_info.num_exceptions, 1);
         assert_eq!(view.for_info.bit_width, 0);
 

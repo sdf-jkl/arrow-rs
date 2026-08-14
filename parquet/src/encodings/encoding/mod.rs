@@ -32,7 +32,8 @@ use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamS
 use bytes::Bytes;
 pub use dict_encoder::DictEncoder;
 
-mod alp_encoder;
+#[doc(hidden)]
+pub mod alp_encoder;
 mod byte_stream_split_encoder;
 mod dict_encoder;
 

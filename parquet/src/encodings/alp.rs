@@ -43,6 +43,11 @@ use crate::util::bit_util::{FromBitpacked, FromBytes};
 pub(crate) const ALP_HEADER_SIZE: usize = 7;
 pub(crate) const ALP_COMPRESSION_MODE: u8 = 0;
 pub(crate) const ALP_INTEGER_ENCODING_FOR_BIT_PACK: u8 = 0;
+/// Experimental, non-spec FastLanes layout used to compare the integer packing
+/// layer. The Parquet ALP specification currently only defines integer encoding
+/// zero; pages with this value are only interoperable with readers that opt in
+/// to this extension.
+pub(crate) const ALP_INTEGER_ENCODING_FASTLANES: u8 = 1;
 pub(crate) const ALP_MIN_LOG_VECTOR_SIZE: u8 = 3;
 pub(crate) const ALP_MAX_LOG_VECTOR_SIZE: u8 = 15;
 /// Spec-recommended default `log_vector_size`: 1024-value vectors.
@@ -245,8 +250,11 @@ impl<Exact: AlpExact> ForInfo<Exact> {
 /// unsigned wrapping arithmetic: this avoids signed overflow when a vector's
 /// range exceeds the signed maximum, and unpacking needs no sign extension.
 /// Signed interpretation is applied later during decimal reconstruction.
+pub(crate) trait FastLanesExact: crate::encodings::fastlanes::FastLanesBitPacking {}
+impl<T: crate::encodings::fastlanes::FastLanesBitPacking> FastLanesExact for T {}
+
 pub(crate) trait AlpExact:
-    Copy + std::fmt::Debug + PartialEq + FromBitpacked + Default
+    Copy + std::fmt::Debug + PartialEq + FromBitpacked + Default + FastLanesExact + Send
 {
     const WIDTH: usize;
     type Signed: Copy + Ord + std::fmt::Debug + Send;

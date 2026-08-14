@@ -34,16 +34,33 @@ use bytes::Bytes;
 
 use crate::basic::Encoding;
 use crate::data_type::DataType;
+use crate::encodings::alp::ALP_INTEGER_ENCODING_FASTLANES;
 use crate::encodings::alp::{
     ALP_COMPRESSION_MODE, ALP_DEFAULT_LOG_VECTOR_SIZE, ALP_HEADER_SIZE,
     ALP_INTEGER_ENCODING_FOR_BIT_PACK, AlpExact, AlpFloat, AlpHeader, AlpInfo, ForInfo,
 };
 use crate::encodings::encoding::Encoder;
+use crate::encodings::fastlanes::FastLanesBitPacking;
 use crate::errors::{ParquetError, Result};
 use crate::util::bit_util::{BitWriter, num_required_bits};
 
 /// Vectors are written at the spec's default size, the ALP paper's 1024.
 const VECTOR_SIZE: usize = 1 << ALP_DEFAULT_LOG_VECTOR_SIZE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegerEncoding {
+    BitPacked,
+    FastLanes,
+}
+
+impl IntegerEncoding {
+    fn header_value(self) -> u8 {
+        match self {
+            Self::BitPacked => ALP_INTEGER_ENCODING_FOR_BIT_PACK,
+            Self::FastLanes => ALP_INTEGER_ENCODING_FASTLANES,
+        }
+    }
+}
 
 /// Values sampled from a vector when estimating a candidate's encoded size.
 const SAMPLES_PER_VECTOR: usize = 256;
@@ -273,6 +290,10 @@ struct Scratch<F: AlpFloat> {
     /// Per-value exception flag (`1` = round-trip failed). A byte, not a bitset,
     /// so the map loop's per-lane store stays vectorizable.
     exc_mask: Vec<u8>,
+    /// Contiguous FOR deltas required by the FastLanes packing implementation.
+    /// The standard bit-packing path computes each delta directly into its
+    /// writer, preserving its original single-pass shape.
+    deltas: Vec<F::Exact>,
     exception_positions: Vec<u16>,
     exception_values: Vec<F>,
     sample: Vec<F>,
@@ -283,6 +304,7 @@ impl<F: AlpFloat> Scratch<F> {
         Self {
             encoded: Vec::new(),
             exc_mask: Vec::new(),
+            deltas: Vec::new(),
             exception_positions: Vec::new(),
             exception_values: Vec::new(),
             sample: Vec::new(),
@@ -292,6 +314,7 @@ impl<F: AlpFloat> Scratch<F> {
     fn estimated_memory_size(&self) -> usize {
         self.encoded.capacity() * std::mem::size_of::<<F::Exact as AlpExact>::Signed>()
             + self.exc_mask.capacity()
+            + self.deltas.capacity() * F::Exact::WIDTH
             + self.exception_positions.capacity() * std::mem::size_of::<u16>()
             + self.exception_values.capacity() * std::mem::size_of::<F>()
             + self.sample.capacity() * std::mem::size_of::<F>()
@@ -303,6 +326,7 @@ impl<F: AlpFloat> Scratch<F> {
 fn encode_vector<F: AlpFloat>(
     values: &[F],
     params: ExponentAndFactor,
+    integer_encoding: IntegerEncoding,
     scratch: &mut Scratch<F>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
@@ -312,6 +336,7 @@ fn encode_vector<F: AlpFloat>(
     let Scratch {
         encoded,
         exc_mask,
+        deltas,
         exception_positions,
         exception_values,
         ..
@@ -379,19 +404,36 @@ fn encode_vector<F: AlpFloat>(
     alp_info.extend_serialized(out);
     for_info.extend_serialized(out);
 
-    // PackedValues: FOR deltas, LSB-first, as the spec requires. A zero bit
-    // width means every value equals the frame of reference, so nothing is
-    // stored.
+    // PackedValues. A zero bit width means every value equals the frame of
+    // reference, so neither layout stores a packed section.
     if bit_width > 0 {
-        let mut writer = BitWriter::new_from_buf(std::mem::take(out));
-        for &encoded_value in encoded.iter() {
-            let delta =
-                F::Exact::reinterpret_from_signed(encoded_value).wrapping_sub(frame_of_reference);
-            writer.put_value(delta.to_u64(), bit_width as usize);
+        match integer_encoding {
+            IntegerEncoding::BitPacked => {
+                // The standard ALP layout: FOR deltas packed LSB-first.
+                let mut writer = BitWriter::new_from_buf(std::mem::take(out));
+                for &encoded_value in encoded.iter() {
+                    let delta = F::Exact::reinterpret_from_signed(encoded_value)
+                        .wrapping_sub(frame_of_reference);
+                    writer.put_value(delta.to_u64(), bit_width as usize);
+                }
+                // Pads to a byte boundary, giving exactly the
+                // ceil(n * bit_width / 8) bytes derived from the metadata.
+                *out = writer.consume();
+            }
+            IntegerEncoding::FastLanes => {
+                deltas.resize(n_values, F::Exact::default());
+                for (delta, &encoded_value) in deltas.iter_mut().zip(encoded.iter()) {
+                    *delta = F::Exact::reinterpret_from_signed(encoded_value)
+                        .wrapping_sub(frame_of_reference);
+                }
+                // FastLanes operates on exactly 1024 values. Padding a short
+                // final vector with zero deltas does not affect its decoded
+                // prefix, but does make its packed section a full vector.
+                deltas.resize(VECTOR_SIZE, F::Exact::default());
+
+                <F::Exact as FastLanesBitPacking>::pack_bytes(bit_width as usize, deltas, out);
+            }
         }
-        // Pads to a byte boundary, giving exactly the ceil(n * bit_width / 8)
-        // bytes the decoder derives from the metadata.
-        *out = writer.consume();
     }
 
     for &position in exception_positions.iter() {
@@ -428,11 +470,12 @@ fn first_non_exception_value<F: AlpFloat>(
 fn encode_page<F: AlpFloat>(
     values: &[F],
     preset: &[ExponentAndFactor],
+    integer_encoding: IntegerEncoding,
     scratch: &mut Scratch<F>,
 ) -> Result<Vec<u8>> {
     let header = AlpHeader {
         compression_mode: ALP_COMPRESSION_MODE,
-        integer_encoding: ALP_INTEGER_ENCODING_FOR_BIT_PACK,
+        integer_encoding: integer_encoding.header_value(),
         vector_size: VECTOR_SIZE,
         num_elements: values.len(),
     };
@@ -455,7 +498,7 @@ fn encode_page<F: AlpFloat>(
         page[offset_at..offset_at + 4].copy_from_slice(&offset.to_le_bytes());
 
         let params = select_params(vector, preset, &mut scratch.sample);
-        encode_vector(vector, params, scratch, &mut page)?;
+        encode_vector(vector, params, integer_encoding, scratch, &mut page)?;
     }
 
     Ok(page)
@@ -506,13 +549,14 @@ impl<F: AlpFloat> StreamingPage<F> {
         &mut self,
         vector: &[F],
         preset: &[ExponentAndFactor],
+        integer_encoding: IntegerEncoding,
         scratch: &mut Scratch<F>,
     ) -> Result<()> {
         let body_start = u32::try_from(self.body.len())
             .map_err(|_| general_err!("Invalid ALP page: body exceeds u32 offset range"))?;
         self.vector_offsets.push(body_start);
         let params = select_params(vector, preset, &mut scratch.sample);
-        encode_vector(vector, params, scratch, &mut self.body)
+        encode_vector(vector, params, integer_encoding, scratch, &mut self.body)
     }
 
     /// Buffer `values`, encoding and dropping every complete vector they form.
@@ -520,6 +564,7 @@ impl<F: AlpFloat> StreamingPage<F> {
         &mut self,
         mut values: &[F],
         preset: &[ExponentAndFactor],
+        integer_encoding: IntegerEncoding,
         scratch: &mut Scratch<F>,
     ) -> Result<()> {
         self.count += values.len();
@@ -536,7 +581,7 @@ impl<F: AlpFloat> StreamingPage<F> {
             // Move the carry out so the vector slice does not alias `self`; the
             // allocation is handed back, cleared, for the next partial to reuse.
             let mut vector = std::mem::take(&mut self.carry);
-            self.push_vector(&vector, preset, scratch)?;
+            self.push_vector(&vector, preset, integer_encoding, scratch)?;
             vector.clear();
             self.carry = vector;
             values = tail;
@@ -545,7 +590,7 @@ impl<F: AlpFloat> StreamingPage<F> {
         // Encode whole vectors straight from the input, no copy.
         let mut chunks = values.chunks_exact(VECTOR_SIZE);
         for vector in chunks.by_ref() {
-            self.push_vector(vector, preset, scratch)?;
+            self.push_vector(vector, preset, integer_encoding, scratch)?;
         }
         self.carry.extend_from_slice(chunks.remainder());
         Ok(())
@@ -556,11 +601,12 @@ impl<F: AlpFloat> StreamingPage<F> {
     fn finish(
         &mut self,
         preset: &[ExponentAndFactor],
+        integer_encoding: IntegerEncoding,
         scratch: &mut Scratch<F>,
     ) -> Result<Vec<u8>> {
         if !self.carry.is_empty() {
             let mut vector = std::mem::take(&mut self.carry);
-            self.push_vector(&vector, preset, scratch)?;
+            self.push_vector(&vector, preset, integer_encoding, scratch)?;
             vector.clear();
             self.carry = vector;
         }
@@ -569,7 +615,7 @@ impl<F: AlpFloat> StreamingPage<F> {
         let offsets_section = num_vectors * std::mem::size_of::<u32>();
         let header = AlpHeader {
             compression_mode: ALP_COMPRESSION_MODE,
-            integer_encoding: ALP_INTEGER_ENCODING_FOR_BIT_PACK,
+            integer_encoding: integer_encoding.header_value(),
             vector_size: VECTOR_SIZE,
             num_elements: self.count,
         };
@@ -598,6 +644,7 @@ impl<F: AlpFloat> StreamingPage<F> {
 /// candidate `(exponent, factor)` set, which needs all of the page's data. Once
 /// that preset is fixed, later pages are encoded incrementally, a vector at a
 /// time, without ever holding the whole page of raw floats (see [`StreamingPage`]).
+#[allow(private_bounds)]
 pub struct AlpEncoder<T: DataType>
 where
     T::T: AlpFloat,
@@ -612,18 +659,36 @@ where
     scratch: Scratch<T::T>,
     /// The page built incrementally, used for every page after the first.
     streaming: StreamingPage<T::T>,
+    integer_encoding: IntegerEncoding,
 }
 
+#[allow(private_bounds)]
 impl<T: DataType> AlpEncoder<T>
 where
     T::T: AlpFloat,
 {
     pub(crate) fn new() -> Self {
+        Self::new_with_integer_encoding(IntegerEncoding::BitPacked)
+    }
+
+    /// Construct an ALP encoder that replaces the spec's LSB-first FOR packing
+    /// with the FastLanes transposed layout.
+    ///
+    /// This is an experimental benchmark API. The emitted pages use the
+    /// reserved `integer_encoding = 1` value and are not standard Parquet ALP
+    /// pages; only a reader with the same extension can decode them.
+    #[doc(hidden)]
+    pub fn new_fastlanes() -> Self {
+        Self::new_with_integer_encoding(IntegerEncoding::FastLanes)
+    }
+
+    fn new_with_integer_encoding(integer_encoding: IntegerEncoding) -> Self {
         Self {
             values: Vec::new(),
             preset: None,
             scratch: Scratch::new(),
             streaming: StreamingPage::new(),
+            integer_encoding,
         }
     }
 
@@ -648,12 +713,13 @@ where
             preset,
             scratch,
             streaming,
+            integer_encoding,
         } = self;
         match preset.as_deref() {
             // First page: buffer until the preset can be built on flush.
             None => buffer.extend_from_slice(values),
             // Later pages: encode incrementally against the fixed preset.
-            Some(preset) => streaming.put(values, preset, scratch)?,
+            Some(preset) => streaming.put(values, preset, *integer_encoding, scratch)?,
         }
         Ok(())
     }
@@ -672,13 +738,22 @@ where
         // identical whether the page is buffered or streamed.
         let len = self.current_page_len();
         let num_vectors = len.div_ceil(VECTOR_SIZE);
-        ALP_HEADER_SIZE
+        let metadata = ALP_HEADER_SIZE
             + num_vectors
                 * (std::mem::size_of::<u32>()
                     + AlpInfo::STORED_SIZE
-                    + ForInfo::<<T::T as AlpFloat>::Exact>::stored_size())
-            + len
-                * (2 * <T::T as AlpFloat>::Exact::WIDTH + std::mem::size_of::<u16>())
+                    + ForInfo::<<T::T as AlpFloat>::Exact>::stored_size());
+        let exception_bytes = len * (<T::T as AlpFloat>::Exact::WIDTH + std::mem::size_of::<u16>());
+        let packed_bytes = match self.integer_encoding {
+            IntegerEncoding::BitPacked => len * <T::T as AlpFloat>::Exact::WIDTH,
+            // FastLanes always packs a complete 1024-value vector, including
+            // the padded tail, so account for a full-width packed section for
+            // every vector in the worst case.
+            IntegerEncoding::FastLanes => {
+                num_vectors * VECTOR_SIZE * <T::T as AlpFloat>::Exact::WIDTH
+            }
+        };
+        metadata + packed_bytes + exception_bytes
     }
 
     fn estimated_memory_size(&self) -> usize {
@@ -696,6 +771,7 @@ where
             preset,
             scratch,
             streaming,
+            integer_encoding,
         } = self;
 
         // The first flush builds the preset from the whole buffered page and
@@ -703,12 +779,12 @@ where
         let page = match preset {
             None => {
                 let built = build_preset(values);
-                let page = encode_page(values, &built, scratch)?;
+                let page = encode_page(values, &built, *integer_encoding, scratch)?;
                 values.clear();
                 *preset = Some(built);
                 page
             }
-            Some(preset) => streaming.finish(preset.as_slice(), scratch)?,
+            Some(preset) => streaming.finish(preset.as_slice(), *integer_encoding, scratch)?,
         };
         Ok(page.into())
     }
@@ -727,7 +803,22 @@ mod tests {
         T::T: AlpFloat,
         <T::T as AlpFloat>::Exact: Send,
     {
-        let mut encoder = AlpEncoder::<T>::new();
+        roundtrip_with_encoder(AlpEncoder::<T>::new(), values)
+    }
+
+    fn roundtrip_fastlanes<T: DataType>(values: &[T::T]) -> Vec<T::T>
+    where
+        T::T: AlpFloat,
+        <T::T as AlpFloat>::Exact: Send,
+    {
+        roundtrip_with_encoder(AlpEncoder::<T>::new_fastlanes(), values)
+    }
+
+    fn roundtrip_with_encoder<T: DataType>(mut encoder: AlpEncoder<T>, values: &[T::T]) -> Vec<T::T>
+    where
+        T::T: AlpFloat,
+        <T::T as AlpFloat>::Exact: Send,
+    {
         encoder.put(values).unwrap();
         let page = encoder.flush_buffer().unwrap();
 
@@ -768,6 +859,73 @@ mod tests {
     fn test_roundtrip_multiple_vectors() {
         let values: Vec<f64> = (0..2600).map(|i| (i as f64) * 0.001).collect();
         assert_bits_eq(&roundtrip::<DoubleType>(&values), &values);
+    }
+
+    #[test]
+    fn test_fastlanes_roundtrip_f32_and_f64() {
+        let mut f64_values: Vec<f64> = (0..2600).map(|i| (i as f64) * 0.001 - 1.0).collect();
+        f64_values[1023] = f64::NAN;
+        f64_values[2048] = -0.0;
+        assert_bits_eq(&roundtrip_fastlanes::<DoubleType>(&f64_values), &f64_values);
+
+        let mut f32_values: Vec<f32> = (0..1300).map(|i| (i as f32) * 0.25).collect();
+        f32_values[1299] = f32::INFINITY;
+        assert_bits_eq(&roundtrip_fastlanes::<FloatType>(&f32_values), &f32_values);
+    }
+
+    #[test]
+    fn test_fastlanes_random_access() {
+        let values: Vec<f64> = (0..2600).map(|i| (i as f64) * 0.01 + 1.23).collect();
+        let mut encoder = AlpEncoder::<DoubleType>::new_fastlanes();
+        encoder.put(&values).unwrap();
+        let page = encoder.flush_buffer().unwrap();
+        assert_eq!(page[1], ALP_INTEGER_ENCODING_FASTLANES);
+
+        let mut decoder = AlpDecoder::<DoubleType>::new();
+        for index in [0, 17, 1023, 1024, 2049, 2599] {
+            decoder.set_data(page.clone(), values.len()).unwrap();
+            assert_eq!(decoder.skip(index).unwrap(), index);
+            let mut actual = [0.0];
+            assert_eq!(decoder.get(&mut actual).unwrap(), 1);
+            assert_eq!(actual[0].to_bits(), values[index].to_bits());
+        }
+    }
+
+    #[test]
+    fn test_fastlanes_streaming_pages() {
+        let mut encoder = AlpEncoder::<DoubleType>::new_fastlanes();
+        for page_idx in 0..3 {
+            let values: Vec<f64> = (0..1500)
+                .map(|i| (i as f64) * 0.01 + page_idx as f64)
+                .collect();
+            for chunk in values.chunks(317) {
+                encoder.put(chunk).unwrap();
+            }
+            let page = encoder.flush_buffer().unwrap();
+            assert_eq!(page[1], ALP_INTEGER_ENCODING_FASTLANES);
+
+            let mut decoder = AlpDecoder::<DoubleType>::new();
+            decoder.set_data(page, values.len()).unwrap();
+            let mut actual = vec![0.0; values.len()];
+            assert_eq!(decoder.get(&mut actual).unwrap(), values.len());
+            assert_bits_eq(&actual, &values);
+        }
+    }
+
+    #[test]
+    fn test_fastlanes_size_estimate_covers_padded_tail() {
+        // Two far-apart integers force a wide packed section even though the
+        // vector has only two values; FastLanes still writes all 1024 slots.
+        let values = [f64::ENCODING_LOWER_LIMIT, 1024.0];
+        let mut encoder = AlpEncoder::<DoubleType>::new_fastlanes();
+        encoder.put(&values).unwrap();
+        let estimate = encoder.estimated_data_encoded_size();
+        let page = encoder.flush_buffer().unwrap();
+        assert!(
+            estimate >= page.len(),
+            "estimated {estimate} bytes, encoded {} bytes",
+            page.len()
+        );
     }
 
     /// The values ALP cannot represent must survive verbatim through the
@@ -925,7 +1083,8 @@ mod tests {
         // in a single pass as the reference.
         let preset = build_preset(&page1);
         let mut scratch = Scratch::<f64>::new();
-        let reference = encode_page(&page2, &preset, &mut scratch).unwrap();
+        let reference =
+            encode_page(&page2, &preset, IntegerEncoding::BitPacked, &mut scratch).unwrap();
 
         assert_eq!(
             streamed.as_ref(),
@@ -1034,13 +1193,8 @@ mod tests {
         let page = encoder.flush_buffer().unwrap();
 
         let vector_start = ALP_HEADER_SIZE + std::mem::size_of::<u32>();
-        let num_exceptions = u16::from_le_bytes([
-            page[vector_start + 2],
-            page[vector_start + 3],
-        ]);
-        let bit_width = page[
-            vector_start + AlpInfo::STORED_SIZE + <f64 as AlpFloat>::Exact::WIDTH
-        ];
+        let num_exceptions = u16::from_le_bytes([page[vector_start + 2], page[vector_start + 3]]);
+        let bit_width = page[vector_start + AlpInfo::STORED_SIZE + <f64 as AlpFloat>::Exact::WIDTH];
         assert_eq!(num_exceptions as usize, VECTOR_SIZE - 2);
         assert_eq!(bit_width, 64);
         assert!(

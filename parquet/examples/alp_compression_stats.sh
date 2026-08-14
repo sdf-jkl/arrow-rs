@@ -264,4 +264,4 @@ cd "$REPO_ROOT"
 export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
 print_environment
 exec cargo run --quiet --release -p parquet \
-  --example alp_compression_stats --features arrow,zstd,experimental -- "$DATA_DIR"
+  --example alp_compression_stats --features arrow,zstd -- "$DATA_DIR"

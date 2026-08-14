@@ -26,16 +26,20 @@ This benchmark evaluates the Apache Parquet implementation of
 - PLAIN encoding without compression
 - PLAIN encoding with ZSTD compression
 - ALP encoding without an additional block compressor
+- ALP with an experimental FastLanes integer layout (speed and random access)
 
-It reports compression speed, decompression speed, and compressed size for all
-30 double-precision datasets in the CWI ALP corpus, plus a focused random-access
-comparison on `city_temperature_f`.
+It reports compression speed and decompression speed for all 30
+double-precision datasets in the CWI ALP corpus, standard Parquet compressed
+size for the first three choices, and a focused random-access comparison on
+`city_temperature_f`.
 
 ## Results preview
 
-Example benchmark run. Speed is machine-dependent; compressed size is
-deterministic. The speed and size rows are arithmetic means of the 30
-per-dataset results.
+Example benchmark run including the experimental FastLanes comparison. Speed
+is machine-dependent; compressed size is deterministic. The speed and size rows
+are arithmetic means of the 30 per-dataset results. FastLanes size is `n/a`
+because the reserved page layout is not emitted through the standard Parquet
+file writer.
 
 ```text
 MACHINE
@@ -45,7 +49,7 @@ ARCHITECTURE    x86_64
 SIMD ISA        AVX-512F, AVX2, AVX
 LOGICAL CPUS    24
 OS / KERNEL     Linux 6.19.10-300.fc44.x86_64
-CPU GOVERNOR    powersave
+CPU GOVERNOR    performance
 RUST            rustc 1.96.1 (31fca3adb 2026-06-26)
 LLVM            22.1.2
 RUSTFLAGS       -C target-cpu=native
@@ -53,19 +57,24 @@ RUSTFLAGS       -C target-cpu=native
 AVERAGE OF ALL 30 DATASETS
 
                      COMPRESSION     DECOMPRESSION     COMPRESSED SIZE
-PLAIN                 70.052 GB/s     70.237 GB/s       64.01 bits/value
-PLAIN + ZSTD           1.485 GB/s      3.232 GB/s       22.75 bits/value
-ALP                    2.145 GB/s     32.432 GB/s       24.27 bits/value
+PLAIN                 53.817 GB/s     64.455 GB/s       64.01 bits/value
+PLAIN + ZSTD           1.317 GB/s      2.958 GB/s       22.75 bits/value
+ALP                    2.069 GB/s     31.783 GB/s       24.27 bits/value
+ALP + FastLanes        2.337 GB/s     43.752 GB/s         n/a
 
 100 RANDOM ROWS FROM city_temperature_f
 
-PLAIN                      2.744 µs
-PLAIN + ZSTD          74,314.500 µs
-ALP                        9.717 µs
+PLAIN                      3.176 µs
+PLAIN + ZSTD          76,124.235 µs
+ALP                        9.817 µs
+ALP + FastLanes            9.275 µs
 ```
 
 <details>
-<summary>Full results for all 30 datasets</summary>
+<summary>Earlier baseline results for all 30 datasets</summary>
+
+These detailed rows predate the FastLanes comparison; run the benchmark to
+produce the current 120-row table containing all four choices.
 
 | Dataset | Parquet choice | Compression (GB/s) | Decompression (GB/s) | Compressed size (bits/value) |
 |---|---|---:|---:|---:|
@@ -197,11 +206,11 @@ file, a one-value-per-line `.csv` file, or a recursively searched directory:
 ```shell
 cargo run --quiet --release -p parquet \
   --example alp_compression_stats \
-  --features arrow,zstd,experimental -- /path/to/data
+  --features arrow,zstd -- /path/to/data
 ```
 
-The `experimental` feature exposes internal page APIs to the example; ALP
-itself is not gated by that feature.
+The benchmark-only FastLanes ALP encoder is available directly in this
+benchmark branch; no additional feature gate is required.
 
 ## What is measured
 
@@ -212,13 +221,14 @@ itself is not gated by that feature.
   values. GB/s uses the uncompressed input size, and file I/O is excluded.
   PLAIN + ZSTD includes both pipeline stages. Short pages are repeated and
   normalized for stable timing; ALP parameter sampling is outside the timed
-  region.
+  region. Standard ALP and ALP + FastLanes use the same fixtures and page
+  boundaries.
 - **Random access:** A fixed seed selects the same 100 rows from
-  `city_temperature_f` on every run. PLAIN and ALP skip to and decode one value.
-  PLAIN + ZSTD decompresses the complete in-memory target page before the PLAIN
-  lookup. File I/O and page discovery are excluded.
+  `city_temperature_f` on every run. PLAIN, ALP, and ALP + FastLanes skip to and
+  decode one value. PLAIN + ZSTD decompresses the complete in-memory target page
+  before the PLAIN lookup. File I/O and page discovery are excluded.
 
-The complete output contains all 90 dataset/encoding combinations and explains
+The complete output contains all 120 dataset/layout combinations and explains
 the units and averaging beside the tables.
 
 ## Reproducibility and privacy

@@ -184,8 +184,7 @@ pub mod data_type;
 
 use std::fmt::Debug;
 use std::ops::Range;
-// Exported for external use, such as benchmarks
-#[cfg(feature = "experimental")]
+// Exported for external use by the bit-packing benchmark.
 #[doc(hidden)]
 pub use self::encodings::{decoding, encoding};
 
@@ -195,10 +194,12 @@ pub use util::utf8;
 
 #[cfg(feature = "arrow")]
 pub mod arrow;
-pub mod column;
-experimental!(mod compression);
-experimental!(mod encodings);
 pub mod bloom_filter;
+pub mod column;
+#[doc(hidden)]
+pub mod compression;
+#[doc(hidden)]
+pub mod encodings;
 
 #[cfg(feature = "encryption")]
 experimental!(pub mod encryption);

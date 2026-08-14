@@ -16,7 +16,9 @@
 // under the License.
 
 //! Compares the on-disk size of three Parquet choices for columns of doubles:
-//! `PLAIN`, `PLAIN + ZSTD`, and `ALP` without a block compressor.
+//! `PLAIN`, `PLAIN + ZSTD`, and `ALP` without a block compressor. The speed and
+//! random-access sections additionally compare the experimental FastLanes
+//! integer layout used by [`AlpEncoder::new_fastlanes`].
 //!
 //! # Reproducing the numbers
 //!
@@ -54,12 +56,13 @@
 //! normalized back to one page before being added to the dataset total. The
 //! reported GB/s uses the uncompressed input size (eight bytes per value). The
 //! companion script builds with `-C target-cpu=native` unless `RUSTFLAGS` is
-//! already set.
+//! already set. FastLanes size is reported as `n/a`: its reserved ALP header
+//! value is intentionally not written through the standard Parquet file writer.
 //!
 //! A focused random-access comparison performs 100 deterministic point lookups
 //! on `city_temperature_f`. Each lookup starts from an in-memory encoded page;
-//! PLAIN + ZSTD must decompress the complete page, while ALP can skip directly
-//! to the vector containing the selected row.
+//! PLAIN + ZSTD must decompress the complete page, while both ALP integer
+//! layouts can skip directly to the vector containing the selected row.
 
 use std::fs::File;
 use std::hint::black_box;
@@ -68,7 +71,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::{Float64Array, RecordBatch};
+use arrow_array::{Array, Float64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Type as PhysicalType;
@@ -76,6 +79,7 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::compression::create_codec;
 use parquet::data_type::DoubleType;
 use parquet::decoding::{Decoder, get_decoder};
+use parquet::encoding::alp_encoder::AlpEncoder;
 use parquet::encoding::get_encoder;
 use parquet::errors::{ParquetError, Result};
 use parquet::file::properties::WriterProperties;
@@ -113,6 +117,7 @@ struct SpeedRow {
     plain: Speed,
     plain_zstd: Speed,
     alp: Speed,
+    alp_fastlanes: Speed,
 }
 
 struct RandomAccessRow {
@@ -120,6 +125,7 @@ struct RandomAccessRow {
     plain_us: f64,
     plain_zstd_us: f64,
     alp_us: f64,
+    alp_fastlanes_us: f64,
 }
 
 struct RandomAccessPage {
@@ -128,6 +134,24 @@ struct RandomAccessPage {
     plain: bytes::Bytes,
     plain_zstd: bytes::Bytes,
     alp: bytes::Bytes,
+    alp_fastlanes: bytes::Bytes,
+}
+
+#[derive(Clone, Copy)]
+enum PageEncoding {
+    Plain,
+    Alp,
+    AlpFastLanes,
+}
+
+impl PageEncoding {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Plain => "PLAIN",
+            Self::Alp => "ALP",
+            Self::AlpFastLanes => "ALP + FastLanes",
+        }
+    }
 }
 
 struct RandomAccessQuery {
@@ -398,36 +422,45 @@ fn print_table(rows: &[Row], speed_rows: &[SpeedRow]) {
             &row.name,
             "PLAIN",
             speed.plain,
-            bits_per_value(row.plain, row.num_values),
+            Some(bits_per_value(row.plain, row.num_values)),
         );
         print_result_row(
             &row.name,
             "PLAIN + ZSTD",
             speed.plain_zstd,
-            bits_per_value(row.plain_zstd, row.num_values),
+            Some(bits_per_value(row.plain_zstd, row.num_values)),
         );
         print_result_row(
             &row.name,
             "ALP",
             speed.alp,
-            bits_per_value(row.alp, row.num_values),
+            Some(bits_per_value(row.alp, row.num_values)),
         );
+        print_result_row(&row.name, "ALP + FastLanes", speed.alp_fastlanes, None);
     }
 
     let (plain_bits, plain_zstd_bits, alp_bits) = arithmetic_means(rows);
-    let (plain_speed, plain_zstd_speed, alp_speed) = speed_arithmetic_means(speed_rows);
+    let (plain_speed, plain_zstd_speed, alp_speed, alp_fastlanes_speed) =
+        speed_arithmetic_means(speed_rows);
     print_average_row("PLAIN", plain_speed, plain_bits);
     print_average_row("PLAIN + ZSTD", plain_zstd_speed, plain_zstd_bits);
     print_average_row("ALP", alp_speed, alp_bits);
+    print_result_row(
+        "**ALL AVG.**",
+        "**ALP + FastLanes**",
+        alp_fastlanes_speed,
+        None,
+    );
 
     println!(
-        "\nGB/s is decimal billions of uncompressed input bytes processed per second; higher is better. Compressed size includes Parquet data-page headers but excludes the file footer. Speed processes every value in pages of up to {SPEED_PAGE_VALUES} values and excludes file I/O. PLAIN + ZSTD includes both stages: PLAIN encoding plus ZSTD compression, and ZSTD decompression plus PLAIN decoding. Short pages are repeated for timing stability and normalized to one page."
+        "\nGB/s is decimal billions of uncompressed input bytes processed per second; higher is better. Compressed size includes Parquet data-page headers but excludes the file footer; FastLanes is n/a because its experimental page layout is not emitted through the standard file writer. Speed processes every value in pages of up to {SPEED_PAGE_VALUES} values and excludes file I/O. PLAIN + ZSTD includes both stages: PLAIN encoding plus ZSTD compression, and ZSTD decompression plus PLAIN decoding. Short pages are repeated for timing stability and normalized to one page."
     );
 }
 
-fn print_result_row(dataset: &str, choice: &str, speed: Speed, bits: f64) {
+fn print_result_row(dataset: &str, choice: &str, speed: Speed, bits: Option<f64>) {
+    let bits = bits.map_or_else(|| "n/a".to_string(), |bits| format!("{bits:.2}"));
     println!(
-        "| {dataset} | {choice} | {:.3} | {:.3} | {bits:.2} |",
+        "| {dataset} | {choice} | {:.3} | {:.3} | {bits} |",
         speed.compression, speed.decompression
     );
 }
@@ -450,14 +483,16 @@ fn print_random_access_table(row: &RandomAccessRow) {
     println!("| PLAIN | {:.3} |", row.plain_us);
     println!("| PLAIN + ZSTD | {:.3} |", row.plain_zstd_us);
     println!("| ALP | {:.3} |", row.alp_us);
+    println!("| ALP + FastLanes | {:.3} |", row.alp_fastlanes_us);
     println!(
-        "\nPLAIN and ALP reset the page decoder, skip to the selected row, and decode one value. PLAIN + ZSTD additionally decompresses the complete target page for every independent lookup. Encoded pages are already in memory; file I/O and page lookup are excluded."
+        "\nPLAIN, ALP, and ALP + FastLanes reset the page decoder, skip to the selected row, and decode one value. PLAIN + ZSTD additionally decompresses the complete target page for every independent lookup. Encoded pages are already in memory; file I/O and page lookup are excluded."
     );
 }
 
 fn print_summary(rows: &[Row], speed_rows: &[SpeedRow]) {
     let (plain_mean, plain_zstd_mean, alp_mean) = arithmetic_means(rows);
-    let (plain_speed, plain_zstd_speed, alp_speed) = speed_arithmetic_means(speed_rows);
+    let (plain_speed, plain_zstd_speed, alp_speed, alp_fastlanes_speed) =
+        speed_arithmetic_means(speed_rows);
     let mut alp_bits: Vec<f64> = rows
         .iter()
         .map(|row| bits_per_value(row.alp, row.num_values))
@@ -492,13 +527,15 @@ fn print_summary(rows: &[Row], speed_rows: &[SpeedRow]) {
         rows.len()
     );
     println!(
-        "Arithmetic mean compression/decompression speed in GB/s: PLAIN {:.3}/{:.3}, PLAIN + ZSTD {:.3}/{:.3}, ALP {:.3}/{:.3}.",
+        "Arithmetic mean compression/decompression speed in GB/s: PLAIN {:.3}/{:.3}, PLAIN + ZSTD {:.3}/{:.3}, ALP {:.3}/{:.3}, ALP + FastLanes {:.3}/{:.3}.",
         plain_speed.compression,
         plain_speed.decompression,
         plain_zstd_speed.compression,
         plain_zstd_speed.decompression,
         alp_speed.compression,
         alp_speed.decompression,
+        alp_fastlanes_speed.compression,
+        alp_fastlanes_speed.decompression,
     );
 }
 
@@ -522,7 +559,7 @@ fn arithmetic_means(rows: &[Row]) -> (f64, f64, f64) {
     (plain, plain_zstd, alp)
 }
 
-fn speed_arithmetic_means(rows: &[SpeedRow]) -> (Speed, Speed, Speed) {
+fn speed_arithmetic_means(rows: &[SpeedRow]) -> (Speed, Speed, Speed, Speed) {
     let average = |select: fn(&SpeedRow) -> Speed| Speed {
         compression: rows.iter().map(|row| select(row).compression).sum::<f64>()
             / rows.len() as f64,
@@ -536,6 +573,7 @@ fn speed_arithmetic_means(rows: &[SpeedRow]) -> (Speed, Speed, Speed) {
         average(|row| row.plain),
         average(|row| row.plain_zstd),
         average(|row| row.alp),
+        average(|row| row.alp_fastlanes),
     )
 }
 
@@ -574,6 +612,8 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
 
     let mut plain_encoder = get_encoder::<DoubleType>(Encoding::PLAIN, &descriptor)?;
     let mut alp_encoder = get_encoder::<DoubleType>(Encoding::ALP, &descriptor)?;
+    let mut alp_fastlanes_encoder: Box<dyn parquet::encoding::Encoder<DoubleType>> =
+        Box::new(AlpEncoder::<DoubleType>::new_fastlanes());
     let mut codec = create_codec(Compression::ZSTD(ZstdLevel::default()), &Default::default())?
         .expect("ZSTD is a compressed codec");
     let mut alp_preset_ready = false;
@@ -582,6 +622,8 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
         if !alp_preset_ready {
             alp_encoder.put(&values)?;
             black_box(alp_encoder.flush_buffer()?);
+            alp_fastlanes_encoder.put(&values)?;
+            black_box(alp_fastlanes_encoder.flush_buffer()?);
             alp_preset_ready = true;
         }
 
@@ -594,6 +636,8 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
             let plain = plain_encoder.flush_buffer()?;
             alp_encoder.put(&values)?;
             let alp = alp_encoder.flush_buffer()?;
+            alp_fastlanes_encoder.put(&values)?;
+            let alp_fastlanes = alp_fastlanes_encoder.flush_buffer()?;
 
             let mut plain_zstd = Vec::new();
             codec.compress(plain.as_ref(), &mut plain_zstd)?;
@@ -603,6 +647,7 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
                 plain,
                 plain_zstd: plain_zstd.into(),
                 alp,
+                alp_fastlanes,
             });
 
             for (query, &index) in indices.iter().enumerate() {
@@ -640,15 +685,47 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
 
     let mut plain_decoder: Box<dyn Decoder<DoubleType>> =
         get_decoder(descriptor.clone(), Encoding::PLAIN)?;
-    decode_random_rows(&mut plain_decoder, &pages, &queries, Encoding::PLAIN, true)?;
+    decode_random_rows(
+        &mut plain_decoder,
+        &pages,
+        &queries,
+        PageEncoding::Plain,
+        true,
+    )?;
     let plain_us = measure_operation(|| {
-        decode_random_rows(&mut plain_decoder, &pages, &queries, Encoding::PLAIN, false)
+        decode_random_rows(
+            &mut plain_decoder,
+            &pages,
+            &queries,
+            PageEncoding::Plain,
+            false,
+        )
     })?;
 
-    let mut alp_decoder: Box<dyn Decoder<DoubleType>> = get_decoder(descriptor, Encoding::ALP)?;
-    decode_random_rows(&mut alp_decoder, &pages, &queries, Encoding::ALP, true)?;
+    let mut alp_decoder: Box<dyn Decoder<DoubleType>> =
+        get_decoder(descriptor.clone(), Encoding::ALP)?;
+    decode_random_rows(&mut alp_decoder, &pages, &queries, PageEncoding::Alp, true)?;
     let alp_us = measure_operation(|| {
-        decode_random_rows(&mut alp_decoder, &pages, &queries, Encoding::ALP, false)
+        decode_random_rows(&mut alp_decoder, &pages, &queries, PageEncoding::Alp, false)
+    })?;
+
+    let mut alp_fastlanes_decoder: Box<dyn Decoder<DoubleType>> =
+        get_decoder(descriptor, Encoding::ALP)?;
+    decode_random_rows(
+        &mut alp_fastlanes_decoder,
+        &pages,
+        &queries,
+        PageEncoding::AlpFastLanes,
+        true,
+    )?;
+    let alp_fastlanes_us = measure_operation(|| {
+        decode_random_rows(
+            &mut alp_fastlanes_decoder,
+            &pages,
+            &queries,
+            PageEncoding::AlpFastLanes,
+            false,
+        )
     })?;
 
     let mut decompressed = Vec::new();
@@ -662,6 +739,7 @@ fn benchmark_random_access(path: &Path, num_values: usize) -> Result<RandomAcces
         plain_us,
         plain_zstd_us: zstd_us + plain_us,
         alp_us,
+        alp_fastlanes_us,
     })
 }
 
@@ -683,28 +761,30 @@ fn decode_random_rows(
     decoder: &mut Box<dyn Decoder<DoubleType>>,
     pages: &[RandomAccessPage],
     queries: &[RandomAccessQuery],
-    encoding: Encoding,
+    encoding: PageEncoding,
     validate: bool,
 ) -> Result<()> {
     let mut decoded = [0.0];
     for query in queries {
         let page = &pages[query.page];
         let data = match encoding {
-            Encoding::PLAIN => &page.plain,
-            Encoding::ALP => &page.alp,
-            _ => unreachable!(),
+            PageEncoding::Plain => &page.plain,
+            PageEncoding::Alp => &page.alp,
+            PageEncoding::AlpFastLanes => &page.alp_fastlanes,
         };
         decoder.set_data(data.clone(), page.num_values)?;
         let skipped = decoder.skip(query.offset)?;
         let read = decoder.get(&mut decoded)?;
         if skipped != query.offset || read != 1 {
             return Err(ParquetError::General(format!(
-                "{encoding} random lookup skipped {skipped} and read {read} values"
+                "{} random lookup skipped {skipped} and read {read} values",
+                encoding.name()
             )));
         }
         if validate && decoded[0].to_bits() != query.expected.to_bits() {
             return Err(ParquetError::General(format!(
-                "{encoding} random lookup did not reproduce row {}",
+                "{} random lookup did not reproduce row {}",
+                encoding.name(),
                 page.start + query.offset
             )));
         }
@@ -781,11 +861,16 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
     let mut alp_encoder = get_encoder::<DoubleType>(Encoding::ALP, descriptor)?;
     let mut alp_decoder: Box<dyn Decoder<DoubleType>> =
         get_decoder(descriptor.clone(), Encoding::ALP)?;
+    let mut alp_fastlanes_encoder: Box<dyn parquet::encoding::Encoder<DoubleType>> =
+        Box::new(AlpEncoder::<DoubleType>::new_fastlanes());
+    let mut alp_fastlanes_decoder: Box<dyn Decoder<DoubleType>> =
+        get_decoder(descriptor.clone(), Encoding::ALP)?;
     let mut codec = create_codec(Compression::ZSTD(ZstdLevel::default()), &Default::default())?
         .expect("ZSTD is a compressed codec");
     let mut plain_totals = TimingTotals::default();
     let mut zstd_totals = TimingTotals::default();
     let mut alp_totals = TimingTotals::default();
+    let mut alp_fastlanes_totals = TimingTotals::default();
     let mut alp_preset_ready = false;
 
     let num_values = for_each_batch(path, |values| {
@@ -794,6 +879,8 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
             // paper's exclusion of first-level sampling from compression speed.
             alp_encoder.put(&values)?;
             black_box(alp_encoder.flush_buffer()?);
+            alp_fastlanes_encoder.put(&values)?;
+            black_box(alp_fastlanes_encoder.flush_buffer()?);
             alp_preset_ready = true;
         }
 
@@ -815,7 +902,7 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
             zstd_decompression + decompression,
         );
 
-        let (_, compression, decompression) = benchmark_encoded_page(
+        let (alp_page, compression, decompression) = benchmark_encoded_page(
             &values,
             &mut alp_encoder,
             &mut alp_decoder,
@@ -823,6 +910,21 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
             repetitions,
         )?;
         alp_totals.add(values.len(), compression, decompression);
+
+        let (alp_fastlanes_page, compression, decompression) = benchmark_encoded_page(
+            &values,
+            &mut alp_fastlanes_encoder,
+            &mut alp_fastlanes_decoder,
+            Encoding::ALP,
+            repetitions,
+        )?;
+        alp_fastlanes_totals.add(values.len(), compression, decompression);
+        assert_alp_record_batches_identical(
+            descriptor,
+            &alp_page,
+            &alp_fastlanes_page,
+            values.len(),
+        )?;
         Ok(())
     })?;
 
@@ -838,7 +940,63 @@ fn benchmark_dataset(path: &Path, descriptor: &ColumnDescPtr) -> Result<SpeedRow
         plain: plain_totals.speed(),
         plain_zstd: zstd_totals.speed(),
         alp: alp_totals.speed(),
+        alp_fastlanes: alp_fastlanes_totals.speed(),
     })
+}
+
+/// Decode both ALP integer layouts outside the timed region and compare the
+/// resulting Arrow batches directly.
+fn assert_alp_record_batches_identical(
+    descriptor: &ColumnDescPtr,
+    alp_page: &bytes::Bytes,
+    fastlanes_page: &bytes::Bytes,
+    num_values: usize,
+) -> Result<()> {
+    let decode = |page: &bytes::Bytes| -> Result<RecordBatch> {
+        let mut decoder: Box<dyn Decoder<DoubleType>> =
+            get_decoder(descriptor.clone(), Encoding::ALP)?;
+        decoder.set_data(page.clone(), num_values)?;
+        let mut values = vec![0.0; num_values];
+        let read = decoder.get(&mut values)?;
+        if read != num_values {
+            return Err(ParquetError::General(format!(
+                "ALP batch validation decoded {read} of {num_values} values"
+            )));
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(values))]).map_err(Into::into)
+    };
+
+    let alp = decode(alp_page)?;
+    let fastlanes = decode(fastlanes_page)?;
+    if alp == fastlanes {
+        return Ok(());
+    }
+
+    // Give a bitwise diagnostic when direct Arrow equality fails. This catches
+    // differences such as NaN payloads and signed zero that ordinary `f64`
+    // equality cannot describe precisely.
+    let alp_values = alp
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validation batch has one Float64 column");
+    let fastlanes_values = fastlanes
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validation batch has one Float64 column");
+    let values_match_bits = alp_values
+        .iter()
+        .zip(fastlanes_values)
+        .all(|(left, right)| left.map(f64::to_bits) == right.map(f64::to_bits));
+    Err(ParquetError::General(format!(
+        "ALP and FastLanes produced different RecordBatches (float bits match: {values_match_bits})"
+    )))
 }
 
 fn benchmark_encoded_page(
