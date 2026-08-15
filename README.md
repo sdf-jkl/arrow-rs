@@ -25,6 +25,7 @@ This benchmark evaluates the Apache Parquet implementation of
 
 - PLAIN encoding without compression
 - PLAIN encoding with ZSTD compression
+- BYTE_STREAM_SPLIT encoding with ZSTD compression
 - ALP encoding without an additional block compressor
 
 It reports compression speed, decompression speed, and compressed size for all
@@ -45,7 +46,7 @@ ARCHITECTURE    x86_64
 SIMD ISA        AVX-512F, AVX2, AVX
 LOGICAL CPUS    24
 OS / KERNEL     Linux 6.19.10-300.fc44.x86_64
-CPU GOVERNOR    powersave
+CPU GOVERNOR    performance
 RUST            rustc 1.96.1 (31fca3adb 2026-06-26)
 LLVM            22.1.2
 RUSTFLAGS       -C target-cpu=native
@@ -53,15 +54,19 @@ RUSTFLAGS       -C target-cpu=native
 AVERAGE OF ALL 30 DATASETS
 
                      COMPRESSION     DECOMPRESSION     COMPRESSED SIZE
-PLAIN                 70.052 GB/s     70.237 GB/s       64.01 bits/value
-PLAIN + ZSTD           1.485 GB/s      3.232 GB/s       22.75 bits/value
-ALP                    2.145 GB/s     32.432 GB/s       24.27 bits/value
+PLAIN                 65.547 GB/s     76.644 GB/s       64.01 bits/value
+PLAIN + ZSTD           1.401 GB/s      3.236 GB/s       22.75 bits/value
+BYTE_STREAM_SPLIT + ZSTD
+                       1.786 GB/s      5.132 GB/s       32.76 bits/value
+ALP                    1.273 GB/s     33.805 GB/s       24.27 bits/value
 
 100 RANDOM ROWS FROM city_temperature_f
 
-PLAIN                      2.744 µs
-PLAIN + ZSTD          74,314.500 µs
-ALP                        9.717 µs
+PLAIN                      2.819 µs
+PLAIN + ZSTD          74,317.077 µs
+BYTE_STREAM_SPLIT + ZSTD
+                      27,025.798 µs
+ALP                       10.007 µs
 ```
 
 <details>
@@ -69,99 +74,130 @@ ALP                        9.717 µs
 
 | Dataset | Parquet choice | Compression (GB/s) | Decompression (GB/s) | Compressed size (bits/value) |
 |---|---|---:|---:|---:|
-| arade4 | PLAIN | 69.061 | 70.101 | 64.01 |
-| arade4 | PLAIN + ZSTD | 0.642 | 1.610 | 37.39 |
-| arade4 | ALP | 2.596 | 33.633 | 24.99 |
-| basel_temp_f | PLAIN | 59.129 | 75.584 | 64.01 |
-| basel_temp_f | PLAIN + ZSTD | 0.459 | 1.647 | 23.07 |
-| basel_temp_f | ALP | 1.394 | 25.053 | 29.23 |
-| basel_wind_f | PLAIN | 73.937 | 76.520 | 64.01 |
-| basel_wind_f | PLAIN + ZSTD | 0.580 | 1.700 | 18.53 |
-| basel_wind_f | ALP | 2.457 | 26.181 | 29.87 |
-| bird_migration_f | PLAIN | 64.358 | 105.274 | 64.01 |
-| bird_migration_f | PLAIN + ZSTD | 0.627 | 1.753 | 23.49 |
-| bird_migration_f | ALP | 2.634 | 25.677 | 20.24 |
-| bitcoin_f | PLAIN | 88.301 | 117.116 | 64.07 |
-| bitcoin_f | PLAIN + ZSTD | 0.575 | 1.619 | 50.01 |
-| bitcoin_f | ALP | 1.757 | 29.426 | 27.18 |
-| bitcoin_transactions_f | PLAIN | 64.054 | 72.216 | 64.01 |
-| bitcoin_transactions_f | PLAIN + ZSTD | 1.077 | 1.979 | 47.96 |
-| bitcoin_transactions_f | ALP | 2.334 | 20.216 | 41.27 |
-| city_temperature_f | PLAIN | 75.395 | 74.838 | 64.01 |
-| city_temperature_f | PLAIN + ZSTD | 0.565 | 1.358 | 17.67 |
-| city_temperature_f | ALP | 2.785 | 32.504 | 10.80 |
-| cms1 | PLAIN | 73.205 | 28.906 | 64.01 |
-| cms1 | PLAIN + ZSTD | 0.646 | 1.485 | 26.84 |
-| cms1 | ALP | 1.357 | 13.815 | 35.19 |
-| cms25 | PLAIN | 71.305 | 72.761 | 64.01 |
-| cms25 | PLAIN + ZSTD | 0.805 | 1.808 | 58.11 |
-| cms25 | ALP | 2.138 | 22.072 | 41.17 |
-| cms9 | PLAIN | 72.501 | 72.698 | 64.01 |
-| cms9 | PLAIN + ZSTD | 0.706 | 1.446 | 11.71 |
-| cms9 | ALP | 2.755 | 31.976 | 12.16 |
-| food_prices | PLAIN | 72.059 | 74.890 | 64.01 |
-| food_prices | PLAIN + ZSTD | 0.575 | 1.337 | 18.13 |
-| food_prices | ALP | 1.158 | 20.248 | 23.20 |
-| gov10 | PLAIN | 73.446 | 74.376 | 64.01 |
-| gov10 | PLAIN + ZSTD | 0.507 | 1.233 | 29.12 |
-| gov10 | ALP | 1.745 | 25.863 | 29.88 |
-| gov26 | PLAIN | 75.234 | 76.379 | 64.01 |
-| gov26 | PLAIN + ZSTD | 12.403 | 25.304 | 0.20 |
-| gov26 | ALP | 2.088 | 94.508 | 1.40 |
-| gov30 | PLAIN | 75.650 | 76.346 | 64.01 |
-| gov30 | PLAIN + ZSTD | 2.201 | 5.256 | 4.52 |
-| gov30 | ALP | 1.207 | 38.220 | 17.88 |
-| gov31 | PLAIN | 66.988 | 67.505 | 64.01 |
-| gov31 | PLAIN + ZSTD | 3.851 | 8.849 | 1.65 |
-| gov31 | ALP | 2.758 | 45.704 | 6.77 |
-| gov40 | PLAIN | 58.871 | 61.174 | 64.01 |
-| gov40 | PLAIN + ZSTD | 8.927 | 16.031 | 0.43 |
-| gov40 | ALP | 2.920 | 71.463 | 2.59 |
-| medicare1 | PLAIN | 56.866 | 53.477 | 64.01 |
-| medicare1 | PLAIN + ZSTD | 0.518 | 1.372 | 31.68 |
-| medicare1 | ALP | 1.215 | 16.534 | 40.46 |
-| medicare9 | PLAIN | 60.603 | 63.031 | 64.01 |
-| medicare9 | PLAIN + ZSTD | 0.691 | 1.434 | 11.86 |
-| medicare9 | ALP | 2.697 | 32.472 | 12.82 |
-| neon_air_pressure | PLAIN | 69.164 | 71.285 | 64.01 |
-| neon_air_pressure | PLAIN + ZSTD | 0.784 | 1.972 | 11.85 |
-| neon_air_pressure | ALP | 2.649 | 33.353 | 16.48 |
-| neon_bio_temp_c | PLAIN | 74.058 | 75.026 | 64.01 |
-| neon_bio_temp_c | PLAIN + ZSTD | 0.560 | 1.546 | 16.84 |
-| neon_bio_temp_c | ALP | 2.770 | 32.755 | 10.81 |
-| neon_dew_point_temp | PLAIN | 71.090 | 72.599 | 64.01 |
-| neon_dew_point_temp | PLAIN + ZSTD | 0.473 | 1.598 | 23.73 |
-| neon_dew_point_temp | ALP | 2.720 | 29.753 | 13.63 |
-| neon_pm10_dust | PLAIN | 53.474 | 74.086 | 64.01 |
-| neon_pm10_dust | PLAIN + ZSTD | 0.841 | 1.652 | 7.79 |
-| neon_pm10_dust | ALP | 1.850 | 34.850 | 8.41 |
-| neon_wind_dir | PLAIN | 69.536 | 71.668 | 64.01 |
-| neon_wind_dir | PLAIN + ZSTD | 0.491 | 1.483 | 24.41 |
-| neon_wind_dir | ALP | 2.706 | 46.888 | 15.94 |
-| nyc29 | PLAIN | 71.389 | 69.178 | 64.01 |
-| nyc29 | PLAIN + ZSTD | 0.625 | 1.496 | 24.67 |
-| nyc29 | ALP | 2.478 | 22.596 | 40.43 |
-| poi_lat | PLAIN | 73.164 | 17.588 | 64.01 |
-| poi_lat | PLAIN + ZSTD | 0.683 | 1.670 | 57.78 |
-| poi_lat | ALP | 1.534 | 11.840 | 88.19 |
-| poi_lon | PLAIN | 74.497 | 21.699 | 64.01 |
-| poi_lon | PLAIN + ZSTD | 0.864 | 1.816 | 60.44 |
-| poi_lon | ALP | 1.681 | 15.246 | 79.12 |
-| ssd_hdd_benchmarks_f | PLAIN | 84.857 | 106.390 | 64.02 |
-| ssd_hdd_benchmarks_f | PLAIN + ZSTD | 0.803 | 1.749 | 12.98 |
-| ssd_hdd_benchmarks_f | ALP | 2.724 | 34.192 | 16.04 |
-| stocks_de | PLAIN | 70.813 | 71.589 | 64.01 |
-| stocks_de | PLAIN + ZSTD | 0.675 | 1.626 | 10.07 |
-| stocks_de | ALP | 1.483 | 33.083 | 11.20 |
-| stocks_uk | PLAIN | 70.262 | 72.069 | 64.01 |
-| stocks_uk | PLAIN + ZSTD | 0.669 | 1.488 | 11.29 |
-| stocks_uk | ALP | 0.938 | 35.205 | 12.75 |
-| stocks_usa_c | PLAIN | 68.303 | 70.749 | 64.01 |
-| stocks_usa_c | PLAIN + ZSTD | 0.737 | 1.637 | 8.24 |
-| stocks_usa_c | ALP | 2.818 | 37.636 | 7.95 |
-| **ALL AVG.** | **PLAIN** | **70.052** | **70.237** | **64.01** |
-| **ALL AVG.** | **PLAIN + ZSTD** | **1.485** | **3.232** | **22.75** |
-| **ALL AVG.** | **ALP** | **2.145** | **32.432** | **24.27** |
+| arade4 | PLAIN | 63.775 | 68.205 | 64.01 |
+| arade4 | PLAIN + ZSTD | 0.574 | 1.499 | 37.39 |
+| arade4 | BYTE_STREAM_SPLIT + ZSTD | 1.875 | 4.980 | 54.58 |
+| arade4 | ALP | 1.698 | 31.860 | 24.99 |
+| basel_temp_f | PLAIN | 33.559 | 57.828 | 64.01 |
+| basel_temp_f | PLAIN + ZSTD | 0.458 | 1.656 | 23.07 |
+| basel_temp_f | BYTE_STREAM_SPLIT + ZSTD | 1.181 | 2.080 | 54.59 |
+| basel_temp_f | ALP | 0.534 | 28.058 | 29.23 |
+| basel_wind_f | PLAIN | 52.641 | 76.402 | 64.01 |
+| basel_wind_f | PLAIN + ZSTD | 0.591 | 1.733 | 18.53 |
+| basel_wind_f | BYTE_STREAM_SPLIT + ZSTD | 1.405 | 2.191 | 54.12 |
+| basel_wind_f | ALP | 0.576 | 29.778 | 29.87 |
+| bird_migration_f | PLAIN | 65.238 | 93.070 | 64.01 |
+| bird_migration_f | PLAIN + ZSTD | 0.420 | 1.778 | 23.49 |
+| bird_migration_f | BYTE_STREAM_SPLIT + ZSTD | 1.210 | 10.407 | 45.82 |
+| bird_migration_f | ALP | 0.164 | 27.212 | 20.24 |
+| bitcoin_f | PLAIN | 91.371 | 222.346 | 64.07 |
+| bitcoin_f | PLAIN + ZSTD | 0.585 | 1.660 | 50.01 |
+| bitcoin_f | BYTE_STREAM_SPLIT + ZSTD | 1.345 | 19.512 | 48.79 |
+| bitcoin_f | ALP | 0.047 | 30.608 | 27.18 |
+| bitcoin_transactions_f | PLAIN | 61.862 | 76.608 | 64.01 |
+| bitcoin_transactions_f | PLAIN + ZSTD | 1.081 | 1.985 | 47.96 |
+| bitcoin_transactions_f | BYTE_STREAM_SPLIT + ZSTD | 1.412 | 2.580 | 56.65 |
+| bitcoin_transactions_f | ALP | 0.572 | 21.192 | 41.27 |
+| city_temperature_f | PLAIN | 74.404 | 75.291 | 64.01 |
+| city_temperature_f | PLAIN + ZSTD | 0.561 | 1.368 | 17.67 |
+| city_temperature_f | BYTE_STREAM_SPLIT + ZSTD | 0.962 | 3.569 | 16.64 |
+| city_temperature_f | ALP | 1.972 | 37.725 | 10.80 |
+| cms1 | PLAIN | 64.257 | 62.655 | 64.01 |
+| cms1 | PLAIN + ZSTD | 0.627 | 1.600 | 26.84 |
+| cms1 | BYTE_STREAM_SPLIT + ZSTD | 0.670 | 1.651 | 38.64 |
+| cms1 | ALP | 1.061 | 18.514 | 35.19 |
+| cms25 | PLAIN | 70.317 | 71.847 | 64.01 |
+| cms25 | PLAIN + ZSTD | 0.798 | 1.829 | 58.11 |
+| cms25 | BYTE_STREAM_SPLIT + ZSTD | 1.287 | 4.345 | 56.72 |
+| cms25 | ALP | 1.516 | 21.901 | 41.17 |
+| cms9 | PLAIN | 65.334 | 67.735 | 64.01 |
+| cms9 | PLAIN + ZSTD | 0.668 | 1.436 | 11.71 |
+| cms9 | BYTE_STREAM_SPLIT + ZSTD | 2.151 | 5.502 | 10.07 |
+| cms9 | ALP | 1.932 | 34.393 | 12.16 |
+| food_prices | PLAIN | 71.786 | 75.631 | 64.01 |
+| food_prices | PLAIN + ZSTD | 0.574 | 1.356 | 18.13 |
+| food_prices | BYTE_STREAM_SPLIT + ZSTD | 0.744 | 1.865 | 25.47 |
+| food_prices | ALP | 0.887 | 20.747 | 23.20 |
+| gov10 | PLAIN | 67.983 | 70.573 | 64.01 |
+| gov10 | PLAIN + ZSTD | 0.486 | 1.259 | 29.12 |
+| gov10 | BYTE_STREAM_SPLIT + ZSTD | 0.648 | 1.740 | 37.31 |
+| gov10 | ALP | 1.119 | 24.621 | 29.88 |
+| gov26 | PLAIN | 66.105 | 67.432 | 64.01 |
+| gov26 | PLAIN + ZSTD | 10.325 | 23.010 | 0.20 |
+| gov26 | BYTE_STREAM_SPLIT + ZSTD | 8.112 | 18.208 | 0.24 |
+| gov26 | ALP | 1.876 | 84.789 | 1.40 |
+| gov30 | PLAIN | 61.089 | 64.308 | 64.01 |
+| gov30 | PLAIN + ZSTD | 2.038 | 5.186 | 4.52 |
+| gov30 | BYTE_STREAM_SPLIT + ZSTD | 1.695 | 4.155 | 6.14 |
+| gov30 | ALP | 1.020 | 33.276 | 17.88 |
+| gov31 | PLAIN | 70.238 | 71.923 | 64.01 |
+| gov31 | PLAIN + ZSTD | 3.821 | 8.994 | 1.65 |
+| gov31 | BYTE_STREAM_SPLIT + ZSTD | 3.780 | 9.643 | 2.47 |
+| gov31 | ALP | 1.659 | 50.153 | 6.77 |
+| gov40 | PLAIN | 74.751 | 75.933 | 64.01 |
+| gov40 | PLAIN + ZSTD | 9.232 | 17.740 | 0.43 |
+| gov40 | BYTE_STREAM_SPLIT + ZSTD | 6.477 | 13.890 | 0.62 |
+| gov40 | ALP | 1.879 | 77.866 | 2.59 |
+| medicare1 | PLAIN | 73.791 | 65.523 | 64.01 |
+| medicare1 | PLAIN + ZSTD | 0.552 | 1.508 | 31.68 |
+| medicare1 | BYTE_STREAM_SPLIT + ZSTD | 0.800 | 2.166 | 45.27 |
+| medicare1 | ALP | 0.958 | 19.660 | 40.46 |
+| medicare9 | PLAIN | 73.908 | 75.228 | 64.01 |
+| medicare9 | PLAIN + ZSTD | 0.706 | 1.471 | 11.86 |
+| medicare9 | BYTE_STREAM_SPLIT + ZSTD | 2.126 | 5.717 | 10.19 |
+| medicare9 | ALP | 1.938 | 36.311 | 12.82 |
+| neon_air_pressure | PLAIN | 70.685 | 73.563 | 64.01 |
+| neon_air_pressure | PLAIN + ZSTD | 0.789 | 2.051 | 11.85 |
+| neon_air_pressure | BYTE_STREAM_SPLIT + ZSTD | 0.782 | 2.268 | 28.51 |
+| neon_air_pressure | ALP | 1.876 | 36.770 | 16.48 |
+| neon_bio_temp_c | PLAIN | 63.818 | 69.314 | 64.01 |
+| neon_bio_temp_c | PLAIN + ZSTD | 0.522 | 1.513 | 16.84 |
+| neon_bio_temp_c | BYTE_STREAM_SPLIT + ZSTD | 1.240 | 2.885 | 35.40 |
+| neon_bio_temp_c | ALP | 1.941 | 35.578 | 10.81 |
+| neon_dew_point_temp | PLAIN | 72.097 | 73.614 | 64.01 |
+| neon_dew_point_temp | PLAIN + ZSTD | 0.465 | 1.638 | 23.73 |
+| neon_dew_point_temp | BYTE_STREAM_SPLIT + ZSTD | 1.503 | 2.370 | 48.00 |
+| neon_dew_point_temp | ALP | 1.931 | 32.863 | 13.63 |
+| neon_pm10_dust | PLAIN | 51.533 | 70.722 | 64.01 |
+| neon_pm10_dust | PLAIN + ZSTD | 0.848 | 1.689 | 7.79 |
+| neon_pm10_dust | BYTE_STREAM_SPLIT + ZSTD | 0.634 | 1.682 | 22.21 |
+| neon_pm10_dust | ALP | 0.927 | 38.427 | 8.41 |
+| neon_wind_dir | PLAIN | 54.631 | 60.583 | 64.01 |
+| neon_wind_dir | PLAIN + ZSTD | 0.432 | 1.312 | 24.41 |
+| neon_wind_dir | BYTE_STREAM_SPLIT + ZSTD | 1.387 | 3.518 | 42.31 |
+| neon_wind_dir | ALP | 1.883 | 47.114 | 15.94 |
+| nyc29 | PLAIN | 71.342 | 71.984 | 64.01 |
+| nyc29 | PLAIN + ZSTD | 0.611 | 1.539 | 24.67 |
+| nyc29 | BYTE_STREAM_SPLIT + ZSTD | 0.939 | 3.768 | 36.91 |
+| nyc29 | ALP | 1.679 | 24.137 | 40.43 |
+| poi_lat | PLAIN | 58.440 | 50.294 | 64.01 |
+| poi_lat | PLAIN + ZSTD | 0.635 | 1.793 | 57.78 |
+| poi_lat | BYTE_STREAM_SPLIT + ZSTD | 2.711 | 5.929 | 55.30 |
+| poi_lat | ALP | 1.052 | 11.874 | 88.19 |
+| poi_lon | PLAIN | 61.546 | 73.497 | 64.01 |
+| poi_lon | PLAIN + ZSTD | 0.850 | 1.945 | 60.44 |
+| poi_lon | BYTE_STREAM_SPLIT + ZSTD | 2.467 | 5.826 | 57.24 |
+| poi_lon | ALP | 1.180 | 14.614 | 79.12 |
+| ssd_hdd_benchmarks_f | PLAIN | 66.698 | 112.905 | 64.02 |
+| ssd_hdd_benchmarks_f | PLAIN + ZSTD | 0.813 | 1.802 | 12.98 |
+| ssd_hdd_benchmarks_f | BYTE_STREAM_SPLIT + ZSTD | 1.265 | 2.850 | 17.42 |
+| ssd_hdd_benchmarks_f | ALP | 0.114 | 35.975 | 16.04 |
+| stocks_de | PLAIN | 68.397 | 71.924 | 64.01 |
+| stocks_de | PLAIN + ZSTD | 0.664 | 1.689 | 10.07 |
+| stocks_de | BYTE_STREAM_SPLIT + ZSTD | 0.881 | 2.278 | 33.46 |
+| stocks_de | ALP | 1.224 | 35.921 | 11.20 |
+| stocks_uk | PLAIN | 60.600 | 64.531 | 64.01 |
+| stocks_uk | PLAIN + ZSTD | 0.608 | 1.413 | 11.29 |
+| stocks_uk | BYTE_STREAM_SPLIT + ZSTD | 1.180 | 4.006 | 14.89 |
+| stocks_uk | ALP | 0.948 | 32.869 | 12.75 |
+| stocks_usa_c | PLAIN | 64.214 | 67.851 | 64.01 |
+| stocks_usa_c | PLAIN + ZSTD | 0.692 | 1.634 | 8.24 |
+| stocks_usa_c | BYTE_STREAM_SPLIT + ZSTD | 0.712 | 2.390 | 26.89 |
+| stocks_usa_c | ALP | 2.028 | 39.329 | 7.95 |
+| **ALL AVG.** | **PLAIN** | **65.547** | **76.644** | **64.01** |
+| **ALL AVG.** | **PLAIN + ZSTD** | **1.401** | **3.236** | **22.75** |
+| **ALL AVG.** | **BYTE_STREAM_SPLIT + ZSTD** | **1.786** | **5.132** | **32.76** |
+| **ALL AVG.** | **ALP** | **1.273** | **33.805** | **24.27** |
 
 </details>
 
@@ -210,15 +246,16 @@ itself is not gated by that feature.
   excludes the file footer.
 - **Speed:** Every value is encoded and decoded in pages of at most 131,072
   values. GB/s uses the uncompressed input size, and file I/O is excluded.
-  PLAIN + ZSTD includes both pipeline stages. Short pages are repeated and
-  normalized for stable timing; ALP parameter sampling is outside the timed
-  region.
+  Both ZSTD choices use compression level 1 and include both pipeline stages.
+  ALP compression includes first-page parameter sampling once per default
+  1,048,576-value row group. Short pages are repeated and normalized for stable
+  timing.
 - **Random access:** A fixed seed selects the same 100 rows from
   `city_temperature_f` on every run. PLAIN and ALP skip to and decode one value.
-  PLAIN + ZSTD decompresses the complete in-memory target page before the PLAIN
-  lookup. File I/O and page discovery are excluded.
+  The ZSTD choices decompress the complete in-memory target page before their
+  encoded lookup. File I/O and page discovery are excluded.
 
-The complete output contains all 90 dataset/encoding combinations and explains
+The complete output contains all 120 dataset/encoding combinations and explains
 the units and averaging beside the tables.
 
 ## Reproducibility and privacy
