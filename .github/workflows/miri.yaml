@@ -17,9 +17,10 @@
 
 name: miri
 
-# Triggered by ci.yml, which owns event routing and concurrency.
+# Supports CI reusable calls and manual runs against any branch or tag.
 on:
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
