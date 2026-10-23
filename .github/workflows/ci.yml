@@ -1,19 +1,18 @@
-name: Fork CI queue probe
-run-name: 'queue probe: ${{ inputs.label }}'
+name: Fork CI cancellation probe
+run-name: 'cancel probe: ${{ github.event_name }}'
 'on':
+  push:
+    branches:
+    - codex/fork-ci-cancel-probe
   workflow_dispatch:
     inputs:
-      label:
-        type: string
-        required: true
       seconds:
         type: string
-        default: '5'
+        default: '120'
 permissions: {}
 concurrency:
-  group: ${{ github.workflow }}
-  queue: max
-  cancel-in-progress: false
+  group: ${{ github.repository }}-${{ github.repository != 'apache/arrow-rs' && github.event_name == 'workflow_dispatch' && 'push' || github.event_name }}-${{ github.event.pull_request.number || (github.repository != 'apache/arrow-rs' && github.ref) || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
 jobs:
   probe:
     runs-on: ubuntu-slim
@@ -21,7 +20,7 @@ jobs:
     steps:
     - name: Hold the slot
       env:
-        SECONDS_TO_WAIT: ${{ inputs.seconds }}
+        SECONDS_TO_WAIT: ${{ inputs.seconds || '120' }}
       run: 'date -u
 
         sleep "$SECONDS_TO_WAIT"
