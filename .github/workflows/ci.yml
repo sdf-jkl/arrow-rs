@@ -20,7 +20,7 @@ jobs:
     steps:
     - name: Hold the slot
       env:
-        SECONDS_TO_WAIT: ${{ inputs.seconds || '120' }}
+        SECONDS_TO_WAIT: ${{ inputs.seconds || '5' }}
       run: 'date -u
 
         sleep "$SECONDS_TO_WAIT"
