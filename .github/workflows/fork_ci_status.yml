@@ -41,6 +41,8 @@ permissions:
 # Serialize notifications and sweeps so they cannot create duplicate checks.
 concurrency:
   group: ${{ github.workflow }}
+  # Preserve pending sweeps when more notifications arrive.
+  queue: max
   cancel-in-progress: false
 
 jobs:
