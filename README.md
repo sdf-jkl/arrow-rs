@@ -201,3 +201,5 @@ You can find more details about each crate in their respective READMEs.
 [pull requests]: https://github.com/apache/arrow-rs/pulls
 [discussions]: https://github.com/apache/arrow-rs/discussions
 [security]: SECURITY.md
+
+<!-- Documentation-only API scan smoke test. -->
