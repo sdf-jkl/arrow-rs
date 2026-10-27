@@ -1,0 +1,62 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Label API changes
+
+on:
+  workflow_run:
+    workflows: [API changes]
+    types: [completed]
+
+permissions:
+  actions: read
+  pull-requests: write
+
+jobs:
+  label:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-slim
+    steps:
+      # Never check out PR code in this workflow: it has permission to add labels.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            if (run.path !== '.github/workflows/api.yml' || !run.head_repository) return;
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              ...context.repo, run_id: run.id, filter: 'latest', per_page: 100,
+            });
+            if (!jobs.some(job => job.name === 'Detect API changes' &&
+                job.steps?.some(step => step.name === 'API changes detected' &&
+                  step.conclusion === 'success'))) return;
+
+            // Fork PRs may be missing from workflow_run.pull_requests. Resolve
+            // them through the API and ignore runs for an outdated PR head.
+            const prs = await github.paginate(github.rest.pulls.list, {
+              ...context.repo, state: 'open',
+              head: run.head_repository.owner.login + ':' + run.head_branch,
+              per_page: 100,
+            });
+            for (const pr of prs) {
+              if (pr.head.sha !== run.head_sha ||
+                  pr.head.repo?.full_name !== run.head_repository.full_name) continue;
+              await github.rest.issues.addLabels({
+                ...context.repo, issue_number: pr.number, labels: ['api-change'],
+              });
+            }
