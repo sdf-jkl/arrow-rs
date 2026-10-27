@@ -47,21 +47,28 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177  # v2.87.30
-        id: install
         with:
           tool: cargo-semver-checks@0.51.0
-      - name: Compare workspace APIs with the target commit
+      - name: Compare public APIs with the target commit
+        id: compare
         # Force detection even if the PR bumps Cargo versions. Comparing with the
         # target commit avoids reporting breaking changes already merged there.
-        run: >-
-          cargo semver-checks check-release --baseline-rev "$BASE_SHA"
-          --release-type minor --workspace --exclude parquet --all-features
-      - name: Compare Parquet APIs with the target commit
-        # Still check Parquet when the workspace comparison fails.
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        # With async enabled, 0.51 confuses ArrowReaderBuilder's sync (&self) and
-        # async (&mut self) get_row_group_column_bloom_filter methods on identical
-        # source. Keep default-feature coverage until that false positive is fixed.
-        run: >-
-          cargo semver-checks check-release --baseline-rev "$BASE_SHA"
-          --release-type minor -p parquet --default-features
+        run: |
+          check_api() {
+            local status=0
+            cargo semver-checks check-release --baseline-rev "$BASE_SHA" \
+              --release-type minor "$@" || status=$?
+            case "$status" in
+              0) ;;
+              100) echo 'breaking=true' >> "$GITHUB_OUTPUT" ;;
+              *) return "$status" ;;
+            esac
+          }
+          check_api --workspace --exclude parquet --all-features
+          # With async enabled, 0.51 confuses the sync (&self) and async (&mut self)
+          # get_row_group_column_bloom_filter methods on identical source.
+          check_api -p parquet --default-features
+      # The label workflow reads this step's conclusion through the Actions API.
+      - name: API changes detected
+        if: steps.compare.outputs.breaking == 'true'
+        run: echo 'Breaking API changes detected; the label workflow will add api-change.'
