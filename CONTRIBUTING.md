@@ -230,12 +230,13 @@ This means that if your PR has a breaking API change, it should be marked as
 `api-change` and it will not be merged until development opens for the next
 major release. See [this ticket] for details.
 
-The informational `Detect API changes` CI check uses `cargo-semver-checks` to flag
-potential API breakage against the target commit, even if the PR bumps versions.
-Inspect failures and label confirmed breakage `api-change`; this check does not
-enforce the release schedule. It checks all features on Linux; Parquet uses
-default features to avoid a known sync/async false positive.
-Manual review remains necessary, including for optional Parquet APIs.
+The `Detect API changes` CI check uses `cargo-semver-checks` to automatically label
+potential API breakage against the target commit `api-change`, even if the PR bumps versions. Detected
+breakage does not fail the check or enforce the release schedule; build and tool
+errors still fail. Existing labels are never automatically removed.
+It checks all features on Linux; Parquet uses default features to avoid a known
+sync/async false positive. Manual review remains necessary, including for optional
+Parquet APIs.
 
 [release schedule]: README.md#release-versioning-and-schedule
 [this ticket]: https://github.com/apache/arrow-rs/issues/5907
