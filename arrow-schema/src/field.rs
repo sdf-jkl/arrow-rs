@@ -635,6 +635,7 @@ impl Field {
     /// If true, the field *may* contain null values.
     #[inline]
     pub const fn is_nullable(&self) -> bool {
+        // Compatible API scan smoke test.
         self.nullable
     }
 
