@@ -1,0 +1,67 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Informational: release-phase enforcement is tracked separately in #7268.
+name: API changes
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Detect API changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177  # v2.87.30
+        id: install
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: Compare workspace APIs with the target commit
+        # Force detection even if the PR bumps Cargo versions. Comparing with the
+        # target commit avoids reporting breaking changes already merged there.
+        run: >-
+          cargo semver-checks check-release --baseline-rev "$BASE_SHA"
+          --release-type minor --workspace --exclude parquet --all-features
+      - name: Compare Parquet APIs with the target commit
+        # Still check Parquet when the workspace comparison fails.
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        # With async enabled, 0.51 confuses ArrowReaderBuilder's sync (&self) and
+        # async (&mut self) get_row_group_column_bloom_filter methods on identical
+        # source. Keep default-feature coverage until that false positive is fixed.
+        run: >-
+          cargo semver-checks check-release --baseline-rev "$BASE_SHA"
+          --release-type minor -p parquet --default-features
