@@ -634,7 +634,7 @@ impl Field {
     ///
     /// If true, the field *may* contain null values.
     #[inline]
-    pub const fn is_nullable(&self) -> bool {
+    pub fn is_nullable(&self) -> bool {
         self.nullable
     }
 
