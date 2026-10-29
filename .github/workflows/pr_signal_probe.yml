@@ -165,6 +165,7 @@ jobs:
 
             async function notify() {
               const run = context.payload.workflow_run;
+              core.info(JSON.stringify({name: run.name, display_title: run.display_title}));
               if (run.event !== 'pull_request' || !run.head_repository ||
                   run.head_branch !== 'codex/pr-signal-probe') return;
               // GitHub can leave workflow_run.pull_requests empty for fork PRs. Resolve
