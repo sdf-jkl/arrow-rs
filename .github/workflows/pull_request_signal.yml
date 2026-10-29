@@ -1,0 +1,37 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Adapted from apache/datafusion#26683 (also SPARK-60440).
+# Signal dev_pr.yml and fork_ci_status.yml without running PR code with a
+# write token. The consumers use workflow_run: requested to avoid waiting
+# for CI or approval of this unprivileged run.
+name: Pull request signal
+# Preserve the opening event for dev_pr.yml's one-time issue-label copy.
+run-name: PR ${{ github.event.pull_request.number }} (${{ github.event.action }})
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  signal:
+    name: Signal pull request update
+    runs-on: ubuntu-slim
+    steps:
+      - run: echo "This run triggers the workflow_run workflows that handle the pull request."

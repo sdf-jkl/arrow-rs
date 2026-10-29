@@ -116,7 +116,7 @@ async function existing(runValue = run()) {
   };
 }
 
-test('CI completion discovers a fork PR even when the event PR list is empty', async () => {
+test('PR signal discovers a fork PR even when the event PR list is empty', async () => {
   const { writes } = await execute({ event: 'workflow_run' });
   assert.equal(writes.length, 1);
   assert.equal(writes[0].head_sha, sha);
@@ -134,7 +134,7 @@ test('notifications ignore stale branch heads, release PRs, closed PRs and delet
     assert.deepEqual((await execute({ event: 'workflow_run', candidates: [candidate] })).writes, []);
   }
 });
-test('upstream pushes and merge-queue completions cannot create fork checks', async () => {
+test('upstream push and merge-queue signals cannot create fork checks', async () => {
   for (const event of ['push', 'merge_group']) {
     assert.deepEqual((await execute({ event: 'workflow_run', notification: { event } })).writes, []);
   }
@@ -314,4 +314,34 @@ test('same-named branches from different fork PRs cannot cancel each other', () 
   const event = { pull_request: { number: 1 } };
   const context = { ...forkPush, repository: 'apache/arrow-rs', event_name: 'pull_request', event };
   assert.notEqual(group(context), group({ ...context, event: { pull_request: { number: 2 } } }));
+});
+
+// The labeler resolves its PR from the same signal, without trusting PR artifacts.
+const labelWorkflow = workflow('dev_pr.yml');
+const findPr = new AsyncFunction('github', 'context', 'core',
+  labelWorkflow.jobs.process.steps[0].with.script);
+test('labeling resolves fork signals with empty PR lists and rejects stale or foreign heads', async () => {
+  for (const candidate of [
+    { ...pr, node_id: 'PR_test' },
+    { ...pr, head: { ...pr.head, sha: 'b'.repeat(40) } },
+    { ...pr, head: { ...pr.head, repo: { full_name: 'other/arrow-rs' } } },
+    { ...pr, head: { ...pr.head, repo: null } },
+  ]) {
+    const outputs = {};
+    const github = {
+      rest: { pulls: { list: () => {} } },
+      paginate: async (_, params) => {
+        assert.equal(params.state, 'open');
+        assert.equal(params.head, 'contributor:feature');
+        return [candidate];
+      },
+    };
+    await findPr(github, {
+      repo: { owner: 'apache', repo: 'arrow-rs' },
+      payload: { workflow_run: {
+        head_sha: sha, head_branch: 'feature', head_repository: pr.head.repo, pull_requests: [],
+      } },
+    }, { setOutput: (name, value) => { outputs[name] = value; } });
+    assert.deepEqual(outputs, candidate.node_id ? { number: pr.number, 'node-id': 'PR_test' } : {});
+  }
 });

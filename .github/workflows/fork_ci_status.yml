@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Mirror fork results as the informational CI (fork) check after upstream PR CI
-# completes and through scheduled polling for late runs and reruns. Read fork
+# Mirror fork results as the informational CI (fork) check when a PR update is
+# signaled and through scheduled polling for late runs and reruns. Read fork
 # runs and write upstream checks using reviewed default-branch code.
 # No checkout, artifacts, or code from the pull request are used here.
 # Test with Python 3.11+, PyYAML, and Node.js 24:
@@ -27,8 +27,8 @@ name: Fork CI status
 
 on:
   workflow_run:
-    workflows: [CI]
-    types: [completed]
+    workflows: [Pull request signal]
+    types: [requested]
   schedule:
     - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
