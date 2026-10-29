@@ -27,7 +27,7 @@ name: Fork CI status
 
 on:
   workflow_run:
-    workflows: [Pull request signal]
+    workflows: [Pull request opened, Pull request signal]
     types: [requested]
   schedule:
     - cron: '7,22,37,52 * * * *'
