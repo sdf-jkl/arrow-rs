@@ -24,7 +24,7 @@ concurrency:
 # Run reviewed default-branch code when a PR update is signaled.
 on:
   workflow_run:
-    workflows: [Pull request signal]
+    workflows: [Pull request opened, Pull request signal]
     types: [requested]
 
 permissions: {}
@@ -80,8 +80,8 @@ jobs:
   # for maintainers to fix up the label manually for more complex cases.
   copy-issue-labels:
     name: Copy labels from (first) closing issue
-    # The signal's run name retains the PR action; workflow_run.action is requested.
-    if: needs.process.outputs.pr-number != '' && endsWith(github.event.workflow_run.display_title, ' (opened)')
+    # Only the opening signal copies issue labels; updates preserve manual changes.
+    if: needs.process.outputs.pr-number != '' && github.event.workflow_run.name == 'Pull request opened'
     needs: process
     runs-on: ubuntu-slim
     permissions:
