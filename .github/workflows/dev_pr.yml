@@ -18,35 +18,60 @@
 name: dev_pr
 
 concurrency:
-  group: ${{ github.repository }}-${{ github.event.pull_request.number }}-${{ github.workflow }}
+  group: ${{ github.repository }}-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}-${{ github.workflow }}
   cancel-in-progress: true
 
-# Trigger whenever a PR is changed (title as well as new / changed commits)
+# Run reviewed default-branch code when a PR update is signaled.
 on:
-  pull_request_target:
-    types:
-      - opened
-      - edited
-      - synchronize
+  workflow_run:
+    workflows: [Pull request signal]
+    types: [requested]
+
+permissions: {}
 
 jobs:
   process:
     name: Process
+    if: github.event.workflow_run.event == 'pull_request'
+    outputs:
+      pr-number: ${{ steps.pr.outputs.number }}
+      pr-node-id: ${{ steps.pr.outputs.node-id }}
     runs-on: ubuntu-slim
     permissions:
       contents: read
       pull-requests: write
     steps:
+      - name: Find the pull request
+        id: pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            if (!run.head_repository) return;
+            // Fork signals may have an empty pull_requests array. Resolve the
+            // current PR through the API, as in fork_ci_status.yml.
+            const prs = await github.paginate(github.rest.pulls.list, {
+              ...context.repo, state: 'open',
+              head: run.head_repository.owner.login + ':' + run.head_branch,
+              per_page: 100,
+            });
+            const pr = prs.find(pr => pr.head.sha === run.head_sha &&
+              pr.head.repo?.full_name.toLowerCase() === run.head_repository.full_name.toLowerCase());
+            if (!pr) return;
+            core.setOutput('number', pr.number);
+            core.setOutput('node-id', pr.node_id);
+      # Only default-branch configuration is used by this privileged workflow.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: steps.pr.outputs.number != ''
+        with:
+          persist-credentials: false
 
       - name: Assign GitHub labels
-        if: |
-          github.event_name == 'pull_request_target' &&
-            (github.event.action == 'opened' ||
-             github.event.action == 'synchronize')
+        if: steps.pr.outputs.number != ''
         uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13  # v7.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ steps.pr.outputs.number }}
           configuration-path: .github/workflows/dev_pr/labeler.yml
           sync-labels: true
 
@@ -55,7 +80,8 @@ jobs:
   # for maintainers to fix up the label manually for more complex cases.
   copy-issue-labels:
     name: Copy labels from (first) closing issue
-    if: github.event.action == 'opened'
+    # The signal's run name retains the PR action; workflow_run.action is requested.
+    if: needs.process.outputs.pr-number != '' && endsWith(github.event.workflow_run.display_title, ' (opened)')
     needs: process
     runs-on: ubuntu-slim
     permissions:
@@ -63,6 +89,9 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          PR_NUMBER: ${{ needs.process.outputs.pr-number }}
+          PR_NODE_ID: ${{ needs.process.outputs.pr-node-id }}
         with:
           script: |
             const { node } = await github.graphql(`
@@ -75,7 +104,7 @@ jobs:
                   }
                 }
               }
-            `, { id: context.payload.pull_request.node_id });
+            `, { id: process.env.PR_NODE_ID });
             const issue = node?.closingIssuesReferences?.nodes[0];
             const repository = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
             // just in case its referencing an external repo
@@ -88,7 +117,7 @@ jobs:
             const labelsToCopy = labels.map(label => label.name).filter(name => allowedLabels.includes(name));
             if (labelsToCopy.length) {
               await github.rest.issues.addLabels({
-                ...context.repo, issue_number: context.issue.number,
+                ...context.repo, issue_number: Number(process.env.PR_NUMBER),
                 labels: labelsToCopy,
               });
             }
