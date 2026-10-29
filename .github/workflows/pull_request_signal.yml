@@ -20,12 +20,10 @@
 # write token. The consumers use workflow_run: requested to avoid waiting
 # for CI or approval of this unprivileged run.
 name: Pull request signal
-# Preserve the opening event for dev_pr.yml's one-time issue-label copy.
-run-name: PR ${{ github.event.pull_request.number }} (${{ github.event.action }})
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [reopened, synchronize]
 
 permissions: {}
 

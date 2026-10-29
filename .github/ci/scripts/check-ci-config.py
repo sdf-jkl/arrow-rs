@@ -77,11 +77,12 @@ def validate_fork_ci(workflows, ci):
     bridge = load_yaml(workflows / "fork_ci_status.yml")
     assert set(bridge[True]) == {"workflow_run", "schedule", "workflow_dispatch"}, "Unexpected fork bridge triggers"
     signal = load_yaml(workflows / "pull_request_signal.yml")
-    notification = {"workflows": [signal["name"]], "types": ["requested"]}
+    opened = load_yaml(workflows / "pull_request_opened.yml")
+    notification = {"workflows": [opened["name"], signal["name"]], "types": ["requested"]}
     assert bridge[True]["workflow_run"] == notification, "Bridge must follow the PR signal"
     labels = load_yaml(workflows / "dev_pr.yml")
     assert labels[True] == {"workflow_run": notification}, "Labeling must follow the PR signal"
-    assert signal["permissions"] == {}, "The PR signal must be unprivileged"
+    assert signal["permissions"] == opened["permissions"] == {}, "PR signals must be unprivileged"
     assert bridge["permissions"] == {"actions": "read", "checks": "write", "pull-requests": "read"}, "Unexpected bridge permissions"
     steps = bridge["jobs"]["bridge"]["steps"]
     assert len(steps) == 1 and steps[0]["uses"].startswith("actions/github-script@"), "Bridge must not check out or execute PR code"
