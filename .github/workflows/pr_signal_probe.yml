@@ -27,7 +27,7 @@ name: Temporary PR signal bridge probe
 
 on:
   workflow_run:
-    workflows: [Pull request signal]
+    workflows: [Pull request opened, Pull request signal]
     types: [requested]
 
 permissions:
