@@ -1,0 +1,48 @@
+name: API cache hash probe
+on:
+  push:
+    branches: [codex/api-cache-hash-probe]
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: Cache hash (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [original, exclude-target]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ff60982bec56228e7f85422369fb44c895c8f218
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Exclude generated manifests in fixed case
+        if: matrix.mode == 'exclude-target'
+        shell: bash
+        run: sed -i "s@hashFiles('\*\*/Cargo.toml')@hashFiles('**/Cargo.toml', '!target/**')@" .github/actions/setup-builder/action.yaml
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: Generate real baseline manifests
+        shell: bash
+        run: cargo semver-checks check-release -p arrow-schema --all-features --baseline-rev fd2b5d156d80c986ff9ba5ace2db84500edf50ec --release-type minor
+      - name: Diagnose permissions and hash as unprivileged user
+        shell: bash
+        run: |
+          id
+          find target/semver-checks -name Cargo.toml -printf '%m %u %p\n'
+          curl -fsSL https://raw.githubusercontent.com/actions/runner/v2.338.2/src/Misc/layoutbin/hashFiles/index.js -o /tmp/hashFiles.js
+          set +e
+          runuser -u nobody -- env patterns='**/Cargo.toml' /__e/node24/bin/node /tmp/hashFiles.js
+          original_status=$?
+          set -e
+          test "$original_status" -eq 1
+          runuser -u nobody -- env patterns=$'**/Cargo.toml\n!target/**' /__e/node24/bin/node /tmp/hashFiles.js
